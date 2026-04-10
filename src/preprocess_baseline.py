@@ -1,23 +1,13 @@
 import pandas as pd
 import numpy as np
+import networkx as nx
 from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-# Data directories (relative to project root)
-DATA_DIR = PROJECT_ROOT / "data"
-RAW_DIR = DATA_DIR / "raw"
-NODE_DIR = RAW_DIR / "Nodes"
-EDGE_DIR = RAW_DIR / "Edges"
-TEMPORAL_DIR = RAW_DIR / "Temporal Data"
-PROC_DIR = DATA_DIR / "processed"
-
-TRAIN_RATIO = 0.6
-VAL_RATIO = 0.2
-TEST_RATIO = 0.2
-
-LAG_WINDOW = 7 
-
+from config.config import (
+    NODE_DIR, TEMPORAL_DIR, PROC_DIR, EDGE_DIR,
+    TRAIN_RATIO, VAL_RATIO, TEST_RATIO, LAG_WINDOW
+)
+pd.set_option("display.max_columns", None) 
+pd.set_option("display.width", 0)  
 def compute_time_splits(num_days: int, train_ratio: float = TRAIN_RATIO, val_ratio: float = VAL_RATIO, test_ratio: float = TEST_RATIO) -> tuple[int, int, int]:
     if not np.isclose(train_ratio + val_ratio + test_ratio, 1.0):
         raise ValueError("Train/val/test ratios must sum to 1.0.")
@@ -74,7 +64,6 @@ def load_temporal_wide(filename: str, value_name: str) -> pd.DataFrame:
         .drop_duplicates(subset=["date", "node_id"], keep="last")
     )
     return df_long
-
 
 def load_raw_data() -> pd.DataFrame:
     df_sales = load_temporal_wide("Sales Order.csv", "sales_order")
@@ -136,14 +125,11 @@ def add_rolling_stats(df: pd.DataFrame,
         )
     return df
 
-
 def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["day_of_week"] = df["date"].dt.weekday
     df["is_weekend"] = df["day_of_week"] >= 5
-    df["month"] = df["date"].dt.month
     return df
-
 
 def create_labels(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(["node_id", "day"]).copy()
@@ -174,36 +160,79 @@ def assign_splits(df: pd.DataFrame,
     return df
 
 def filter_valid_samples(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Remove rows that do not have valid lag features or labels.
-
-    This filters out:
-      - the first LAG_WINDOW-1 days where lag features are NaN,
-      - the last days where y_h1 or y_h7 are NaN due to shifting.
-    """
     lag_cols = [c for c in df.columns if "lag" in c]
     label_cols = ["y_h1", "y_h7"]
     df = df.dropna(subset=lag_cols + label_cols)
     return df
 
+def compute_graph_stats(edge_file: Path,
+                        node_index_file: Path,
+                        edge_type: str,
+                        out_path: Path) -> None:
+    edges = pd.read_csv(edge_file)
+    if {"node1", "node2"}.issubset(edges.columns):
+        u_col, v_col = "node1", "node2"
+    else:
+        raise ValueError(f"Unknown edge file format: {edge_file}")
+
+    G = nx.Graph()
+    for _, row in edges.iterrows():
+        G.add_edge(int(row[u_col]), int(row[v_col]))
+
+    deg = dict(G.degree())
+    clustering = nx.clustering(G)
+    closeness = nx.closeness_centrality(G)
+    betweenness = nx.betweenness_centrality(G, normalized=True)
+
+    df_stats = pd.DataFrame({
+        "node_index": list(deg.keys()),
+        f"{edge_type}_deg": list(deg.values()),
+        f"{edge_type}_clustering": [clustering[n] for n in deg.keys()],
+        f"{edge_type}_closeness": [closeness[n] for n in deg.keys()],
+        f"{edge_type}_betweenness": [betweenness[n] for n in deg.keys()],
+    })
+
+    df_idx = pd.read_csv(node_index_file).rename(
+        columns={"Node": "node_id", "NodeIndex": "node_index"}
+    )
+    df_stats = df_stats.merge(df_idx, on="node_index", how="left")
+
+    df_stats.to_csv(out_path, index=False)
+    print(f"Saved graph stats for {edge_type} to {out_path}")
+
+def load_graph_stats() -> None:
+    node_index_file = NODE_DIR / "NodesIndex.csv"
+    edge_defs = [
+        (EDGE_DIR / "Edges (Plant).csv", "plant"),
+        (EDGE_DIR / "Edges (Product Group).csv", "product_group"),
+        (EDGE_DIR / "Edges (Product Sub-Group).csv", "sub_group"),
+        (EDGE_DIR / "Edges (Storage Location).csv", "storage_location"),
+    ]
+
+    for edge_file, et in edge_defs:
+        out_path = PROC_DIR / "graph_stats" / f"graph_stats_{et}.csv"
+        compute_graph_stats(
+            edge_file=edge_file,
+            node_index_file=node_index_file,
+            edge_type=et,
+            out_path=out_path,
+        )
+
 def merge_all_graph_stats(df: pd.DataFrame) -> pd.DataFrame:
+
     stats_dir = PROC_DIR / "graph_stats"
     edge_types = ["plant", "product_group", "sub_group", "storage_location"]
 
     for et in edge_types:
         path = stats_dir / f"graph_stats_{et}.csv"
         g = pd.read_csv(path)
-
-        # chỉ giữ node_id + các stats, bỏ node_index trong file stats
         if "node_index" in g.columns:
             g = g.drop(columns=["node_index"])
 
         df = df.merge(g, on="node_id", how="left")
 
     return df
-# ---------------------------------------------------------------------
-# Main preprocessing pipeline
-# ---------------------------------------------------------------------
+
 def build_xgboost_datasets() -> None:
     df = load_raw_data()
     lag_cols = ["sales_order", "production", "delivery", "factory_issue"]
@@ -214,37 +243,11 @@ def build_xgboost_datasets() -> None:
     df = assign_splits(df)
     df = filter_valid_samples(df)
 
-    # lưu base dùng chung cho baseline_2, baseline_3
     PROC_DIR.mkdir(parents=True, exist_ok=True)
     df.to_parquet(PROC_DIR / "xgboost_base_filtered.parquet", index=False)
 
-    feature_cols = [
-        c for c in df.columns
-        if any(
-            kw in c
-            for kw in [
-                "lag", "roll",
-                "group", "sub_group", "plant", "storage_location",
-                "day_of_week", "is_weekend", "month",
-            ]
-        )
-    ]
-    base_cols = ["node_id", "node_index", "date", "day", "split"]
-
-    df_h1 = df[base_cols + feature_cols + ["y_h1"]].rename(columns={"y_h1": "target"})
-    df_h7 = df[base_cols + feature_cols + ["y_h7"]].rename(columns={"y_h7": "target"})
-
-    df_h1.to_parquet(PROC_DIR / "baseline_1" / "xgboost_h1.parquet", index=False)
-    df_h7.to_parquet(PROC_DIR / "baseline_1" / "xgboost_h7.parquet", index=False)
-
-
-def build_xgboost_datasets_graph_stats() -> None:
-    # dùng đúng df đã filter của baseline 1
-    df = pd.read_parquet(PROC_DIR / "xgboost_base_filtered.parquet")
-
-    # chỉ thêm graph stats, KHÔNG tạo lại label/split/filter
+    load_graph_stats()
     df = merge_all_graph_stats(df)
-
     feature_cols = [
         c for c in df.columns
         if any(
@@ -252,36 +255,39 @@ def build_xgboost_datasets_graph_stats() -> None:
             for kw in [
                 "lag", "roll",
                 "group", "sub_group",
-                "primary_plant", "primary_storage",
-                "num_plants", "num_storages",
+                "plant", "storage_location",
                 "day_of_week", "is_weekend", "month",
                 "deg", "betweenness", "closeness", "clustering",
             ]
         )
     ]
     base_cols = ["node_id", "node_index", "date", "day", "split"]
+    out_dir = PROC_DIR / "baseline"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     df_h1 = df[base_cols + feature_cols + ["y_h1"]].rename(columns={"y_h1": "target"})
     df_h7 = df[base_cols + feature_cols + ["y_h7"]].rename(columns={"y_h7": "target"})
+    
+    df_h1.to_parquet(out_dir / "xgboost_h1.parquet", index=False)
+    df_h7.to_parquet(out_dir / "xgboost_h7.parquet", index=False)
+    print(f"Saved baseline datasets with horizon 1 to {out_dir} / xgboost_h1.parquet")
+    print(f"Saved baseline datasets with horizon 7 to {out_dir} / xgboost_h7.parquet")
 
-    out_dir = PROC_DIR / "baseline_2"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    df_h1.to_parquet(out_dir / "xgboost_h1_graph_stats_all.parquet", index=False)
-    df_h7.to_parquet(out_dir / "xgboost_h7_graph_stats_all.parquet", index=False)
-def select_graph_feature_cols(df_columns, edge_types: list[str]) -> list[str]:
-    cols = []
-    for et in edge_types:
-        cols += [c for c in df_columns if c.startswith(et + "_")]
-    return cols
+    df_h1.to_csv(out_dir / "xgboost_h1_full.csv", index=False)
+    df_h7.to_csv(out_dir / "xgboost_h7_full.csv", index=False)
+
+    print(f"Saved H=1 CSV to {out_dir / 'xgboost_h1_full.csv'}")
+    print(f"Saved H=7 CSV to {out_dir / 'xgboost_h7_full.csv'}")
+    
+    print("\n=== Columns in baseline H=1 ===")
+    print(list(df_h1.columns))
+
+    print("\n=== Columns in baseline H=7 ===")
+    print(list(df_h7.columns))
+
 
 def main() -> None:
     build_xgboost_datasets()
-    build_xgboost_datasets_graph_stats()
-
-    df_b1 = pd.read_parquet(PROC_DIR / "baseline_1" / "xgboost_h1.parquet")
-    df_b2 = pd.read_parquet(PROC_DIR / "baseline_2" / "xgboost_h1_graph_stats_all.parquet")
-    print("B1 rows:", len(df_b1), "nodes:", df_b1["node_id"].nunique(), "days:", df_b1["day"].nunique())
-    print("B2 rows:", len(df_b2), "nodes:", df_b2["node_id"].nunique(), "days:", df_b2["day"].nunique())
 
 if __name__ == "__main__":
     main()

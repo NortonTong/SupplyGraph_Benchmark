@@ -1,4 +1,4 @@
-node_index,group_deg,group_clustering,group_closeness,group_betweenness,node_id
+node_index,product_group_deg,product_group_clustering,product_group_closeness,product_group_betweenness,node_id
 0,13,1.0,0.3333333333333333,0.0,SOS008L02P
 1,13,1.0,0.3333333333333333,0.0,SOS005L04P
 2,13,1.0,0.3333333333333333,0.0,SOS003L04P
