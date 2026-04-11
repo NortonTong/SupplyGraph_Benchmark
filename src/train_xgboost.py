@@ -2,18 +2,23 @@ import pandas as pd
 from xgboost import XGBRegressor
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error
 import matplotlib.pyplot as plt
-from config.config import ( DATA_DIR, PROC_DIR )
+
+from config.config import (
+    DATA_DIR, PROC_DIR,
+    LAG_WINDOWS,   # list, ví dụ [7, 14, 21]
+)
 
 RUN_SUMMARY = []
 
-def load_dataset(horizon: int) -> pd.DataFrame:
-    path = PROC_DIR / "baseline" / f"xgboost_h{horizon}.parquet"
+
+def load_dataset(horizon: int, lag_window: int) -> pd.DataFrame:
+    path = PROC_DIR / "baseline" / f"xgboost_h{horizon}_lag{lag_window}.parquet"
+    print(f"Loading dataset from {path}")
     return pd.read_parquet(path)
 
 
 def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     target = df["target"].astype(float)
-
     drop_cols = [
         "target",
         "split",
@@ -23,13 +28,11 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
         "day",
     ]
     feature_cols = [c for c in df.columns if c not in drop_cols]
-
     X = df[feature_cols].copy()
     return X, target
 
 
 def one_hot_encode_train_val_test(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-
     df_train = df[df["split"] == "train"].copy()
     df_val = df[df["split"] == "val"].copy()
     df_test = df[df["split"] == "test"].copy()
@@ -44,10 +47,12 @@ def one_hot_encode_train_val_test(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Da
     df_train_enc = pd.get_dummies(df_train, columns=cat_cols, drop_first=False)
     df_val_enc = pd.get_dummies(df_val, columns=cat_cols, drop_first=False)
     df_test_enc = pd.get_dummies(df_test, columns=cat_cols, drop_first=False)
+
     df_val_enc = df_val_enc.reindex(columns=df_train_enc.columns, fill_value=0)
     df_test_enc = df_test_enc.reindex(columns=df_train_enc.columns, fill_value=0)
 
     return df_train_enc, df_val_enc, df_test_enc
+
 
 def one_hot_encode_train_val_test_for_rolling(df_train: pd.DataFrame,
                                               df_test: pd.DataFrame):
@@ -65,13 +70,15 @@ def one_hot_encode_train_val_test_for_rolling(df_train: pd.DataFrame,
 
     return df_train_enc, None, df_test_enc
 
+
 def rolling_origin_evaluation(horizon: int,
+                              lag_window: int,
                               origins: list[int]) -> None:
-    df = load_dataset(horizon=horizon)
+    df = load_dataset(horizon=horizon, lag_window=lag_window)
     errors = []
 
     for T in origins:
-        print(f"\n=== Rolling origin at day {T}, horizon {horizon} ===")
+        print(f"\n=== Rolling origin at day {T}, horizon {horizon}, lag={lag_window} ===")
         df_train = df[df["day"] <= T].copy()
         df_test = df[df["day"] == T + horizon].copy()
 
@@ -79,7 +86,7 @@ def rolling_origin_evaluation(horizon: int,
             print(f"No test samples for origin {T} (day={T+horizon}). Skipping.")
             continue
 
-        df_train_enc, df_val_dummy, df_test_enc = one_hot_encode_train_val_test_for_rolling(
+        df_train_enc, _, df_test_enc = one_hot_encode_train_val_test_for_rolling(
             df_train, df_test
         )
 
@@ -88,8 +95,8 @@ def rolling_origin_evaluation(horizon: int,
 
         model = XGBRegressor(
             n_estimators=500,
-            max_depth=6,
-            learning_rate=0.05,
+            max_depth=3,
+            learning_rate=0.005,
             subsample=0.8,
             colsample_bytree=0.8,
             objective="reg:squarederror",
@@ -118,6 +125,7 @@ def rolling_origin_evaluation(horizon: int,
         print("\nAverage over origins:")
         print(df_err.mean(numeric_only=True))
 
+
 GRAPH_PREFIXES = [
     "plant_", "product_group_", "sub_group_", "storage_location_",
     "plant_gcn_emb_", "product_group_gcn_emb_",
@@ -133,6 +141,7 @@ STATIC_GRAPH_COLS = [
     "storage_location_deg", "storage_location_clustering",
     "storage_location_closeness", "storage_location_betweenness",
 ]
+
 
 def prepare_features_with_ablation(df: pd.DataFrame,
                                    graph_edge_types: list[str] | None,
@@ -165,6 +174,7 @@ def prepare_features_with_ablation(df: pd.DataFrame,
 
     return X, target
 
+
 def attach_gnn_embeddings_to_split(
     df_split: pd.DataFrame,
     graph_edge_types: list[str],
@@ -188,6 +198,7 @@ def attach_gnn_embeddings_to_split(
 
 def train_and_evaluate_xgboost(
     horizon: int,
+    lag_window: int,
     variant: str,
     graph_edge_types: list[str] | None = None,
     tag: str | None = None,
@@ -195,10 +206,11 @@ def train_and_evaluate_xgboost(
     if tag is None:
         tag = "default"
 
-    print(f"\n=== Training XGBoost H{horizon}, variant={variant}, tag={tag} ===")
-    df = load_dataset(horizon=horizon)
+    print(f"\n=== Training XGBoost H{horizon}, lag={lag_window}, variant={variant}, tag={tag} ===")
+    df = load_dataset(horizon=horizon, lag_window=lag_window)
 
-    print(f"H{horizon} {variant}: df rows={len(df)}, unique(node,date)={df[['node_id','date']].drop_duplicates().shape[0]}")
+    print(f"H{horizon} {variant} lag{lag_window}: df rows={len(df)}, "
+          f"unique(node,date)={df[['node_id','date']].drop_duplicates().shape[0]}")
 
     df_train_enc, df_val_enc, df_test_enc = one_hot_encode_train_val_test(df)
     print("Splits rows:", len(df_train_enc), len(df_val_enc), len(df_test_enc))
@@ -208,17 +220,15 @@ def train_and_evaluate_xgboost(
         df_val_enc   = attach_gnn_embeddings_to_split(df_val_enc,   graph_edge_types)
         df_test_enc  = attach_gnn_embeddings_to_split(df_test_enc,  graph_edge_types)
         print("Splits rows after GNN merge:", len(df_train_enc), len(df_val_enc), len(df_test_enc))
-    if variant == "baseline_3":
-        drop_static = True
-    else:
-        drop_static = False
+
+    drop_static = (variant == "baseline_3")
 
     X_train, y_train = prepare_features_with_ablation(df_train_enc, graph_edge_types, drop_static)
     X_val, y_val = prepare_features_with_ablation(df_val_enc, graph_edge_types, drop_static)
     X_test, y_test = prepare_features_with_ablation(df_test_enc, graph_edge_types, drop_static)
 
     feature_names = list(X_train.columns)
-    print(f"\n[H{horizon}][{variant}][{tag}] Using {len(feature_names)} features:")
+    print(f"\n[H{horizon}][lag{lag_window}][{variant}][{tag}] Using {len(feature_names)} features:")
     print(feature_names)
 
     print(f"Train samples: {X_train.shape[0]}")
@@ -226,9 +236,9 @@ def train_and_evaluate_xgboost(
     print(f"Test  samples: {X_test.shape[0]}")
 
     model = XGBRegressor(
-        n_estimators=5000,         
+        n_estimators=5000,
         max_depth=6,
-        learning_rate=0.05,
+        learning_rate=0.001,
         subsample=0.8,
         colsample_bytree=0.8,
         objective="reg:squarederror",
@@ -243,7 +253,7 @@ def train_and_evaluate_xgboost(
 
     model.fit(
         X_train, y_train,
-        eval_set=eval_set,   
+        eval_set=eval_set,
         verbose=False,
     )
 
@@ -257,21 +267,22 @@ def train_and_evaluate_xgboost(
     plt.axvline(model.best_iteration, color="red", linestyle="--", label="Best iter")
     plt.xlabel("Boosting round")
     plt.ylabel("RMSE")
-    plt.title(f"Learning curve H{horizon} - {variant} - {tag}")
+    plt.title(f"Learning curve H{horizon} lag{lag_window} - {variant} - {tag}")
     plt.legend()
     plt.tight_layout()
 
-    out_curve = PROC_DIR / "plots" / variant / f"learning_curve_h{horizon}_{tag}.png"
+    out_curve = PROC_DIR / "plots" / variant / f"learning_curve_h{horizon}_lag{lag_window}_{tag}.png"
     out_curve.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_curve, dpi=150)
     plt.close()
 
     print(f"Saved learning curve to {out_curve}")
+
     y_val_pred = model.predict(X_val)
     mae_val = mean_absolute_error(y_val, y_val_pred)
     rmse_val = root_mean_squared_error(y_val, y_val_pred)
 
-    print(f"\n[H{horizon}][{variant}][{tag}] Validation:")
+    print(f"\n[H{horizon}][lag{lag_window}][{variant}][{tag}] Validation:")
     print(f"  MAE  : {mae_val:.4f}")
     print(f"  RMSE : {rmse_val:.4f}")
 
@@ -279,21 +290,23 @@ def train_and_evaluate_xgboost(
     mae_test = mean_absolute_error(y_test, y_test_pred)
     rmse_test = root_mean_squared_error(y_test, y_test_pred)
 
-
-    print(f"\n[H{horizon}][{variant}][{tag}] Test:")
+    print(f"\n[H{horizon}][lag{lag_window}][{variant}][{tag}] Test:")
     print(f"  MAE  : {mae_test:.4f}")
     print(f"  RMSE : {rmse_test:.4f}")
+
     RUN_SUMMARY.append({
-    "variant": variant,
-    "tag": tag,
-    "horizon": horizon,
-    "n_features": X_train.shape[1],
-    "MAE_val": mae_val,
-    "RMSE_val": rmse_val,
-    "MAE_test": mae_test,
-    "RMSE_test": rmse_test,
+        "lag_window": lag_window,
+        "variant": variant,
+        "tag": tag,
+        "horizon": horizon,
+        "n_features": X_train.shape[1],
+        "MAE_val": mae_val,
+        "RMSE_val": rmse_val,
+        "MAE_test": mae_test,
+        "RMSE_test": rmse_test,
     })
-    out_dir = PROC_DIR / "predictions" / variant / tag
+
+    out_dir = PROC_DIR / "predictions" / variant / f"lag{lag_window}" / tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
     pd.DataFrame({
@@ -301,54 +314,78 @@ def train_and_evaluate_xgboost(
         "date": df_test_enc["date"],
         "y_true": y_test,
         "y_pred": y_test_pred,
-    }).to_csv(out_dir / f"xgb_h{horizon}_test_predictions.csv", index=False)
-    print(f"\nSaved test predictions to {out_dir / f'xgb_h{horizon}_test_predictions.csv'}")
+    }).to_csv(out_dir / f"xgb_h{horizon}_lag{lag_window}_test_predictions.csv", index=False)
+    print(f"\nSaved test predictions to {out_dir / f'xgb_h{horizon}_lag{lag_window}_test_predictions.csv'}")
 
+def build_gru_ready_baseline(horizon: int, lag_window: int) -> None:
+    """
+    Reuse load_dataset + one_hot_encode_train_val_test để tạo
+    file baseline cho GRU (đã one-hot và có cột split).
+    """
+    df = load_dataset(horizon=horizon, lag_window=lag_window)
 
+    df_train_enc, df_val_enc, df_test_enc = one_hot_encode_train_val_test(df)
+
+    # Thêm cột split lại (vì one-hot encode đã giữ cột split rồi)
+    df_enc = pd.concat([df_train_enc, df_val_enc, df_test_enc], axis=0)
+    df_enc = df_enc.sort_values(["date", "node_id"])
+
+    out_path = PROC_DIR / "baseline" / f"gru_ready_h{horizon}_lag{lag_window}.parquet"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df_enc.to_parquet(out_path, index=False)
+    print(f"Saved GRU-ready baseline to {out_path}")
 
 def main():
     global RUN_SUMMARY
     RUN_SUMMARY = []
 
-    for h in (1, 7):
-        train_and_evaluate_xgboost(
-            horizon=h,
-            variant="baseline_1",
-            graph_edge_types=None, 
-            tag="B1",
+    # baseline_1: không dùng graph edge types
+    for lag_w in LAG_WINDOWS:
+        for h in (1, 7):
+            train_and_evaluate_xgboost(
+                horizon=h,
+                lag_window=lag_w,
+                variant="baseline_1",
+                graph_edge_types=None,
+                tag=f"B1_lag{lag_w}",
+            )
+
+        rolling_origin_evaluation(
+            horizon=7,
+            lag_window=lag_w,
+            origins=[100, 150, 190],
         )
 
-    rolling_origin_evaluation(
-        horizon=7,
-        origins=[100, 150, 190],
-    )
-
+    # baseline_2: graph edge types
     graph_settings = {
         "B2_plant": ["plant"],
         "B2_group": ["product_group"],
         "B2_subgroup": ["sub_group"],
         "B2_storage": ["storage_location"],
-
         "B2_plant_group": ["plant", "product_group"],
         "B2_plant_subgroup": ["plant", "sub_group"],
         "B2_plant_storage": ["plant", "storage_location"],
     }
-    
 
-    for tag, edges in graph_settings.items():
-        for h in (1, 7):
-            train_and_evaluate_xgboost(
-                horizon=h,
-                variant="baseline_2",    
-                graph_edge_types=edges,
-                tag=tag,
-            )
+    for lag_w in LAG_WINDOWS:
+        for tag, edges in graph_settings.items():
+            for h in (1, 7):
+                train_and_evaluate_xgboost(
+                    horizon=h,
+                    lag_window=lag_w,
+                    variant="baseline_2",
+                    graph_edge_types=edges,
+                    tag=tag,
+                )
 
         rolling_origin_evaluation(
             horizon=7,
+            lag_window=lag_w,
             origins=[100, 150, 190],
         )
-    
+
+    # baseline_3: GNN embeddings
+ 
     graph_settings_gnn = {
         "B3_gcn_only": [
             "plant_gcn_emb", "product_group_gcn_emb",
@@ -370,25 +407,33 @@ def main():
         ],
     }
 
-    for tag, edges in graph_settings_gnn.items():
+    for lag_w in LAG_WINDOWS:
+        for tag, edges in graph_settings_gnn.items():
+            for h in (1, 7):
+                train_and_evaluate_xgboost(
+                    horizon=h,
+                    lag_window=lag_w,
+                    variant="baseline_3",
+                    graph_edge_types=edges,
+                    tag=tag,
+                )
+
+    for lag_w in LAG_WINDOWS:
         for h in (1, 7):
-            train_and_evaluate_xgboost(
-                horizon=h,
-                variant="baseline_3",
-                graph_edge_types=edges,
-                tag=tag,
-            )
+            build_gru_ready_baseline(horizon=h, lag_window=lag_w)
+
+    # summary
     if RUN_SUMMARY:
         df_sum = pd.DataFrame(RUN_SUMMARY)
-        print("\n=== Overall summary (all baselines & variants) ===")
-        df_sum = df_sum.sort_values(["horizon", "variant", "tag"])
+        print("\n=== Overall summary (all baselines, variants, lags) ===")
+        df_sum = df_sum.sort_values(["lag_window", "horizon", "variant", "tag"])
         print(df_sum[[
-            "horizon", "variant", "tag",
+            "lag_window", "horizon", "variant", "tag",
             "n_features",
             "MAE_test", "RMSE_test",
         ]])
 
-        out_path = PROC_DIR / "predictions" / "summary_all_baselines.csv"
+        out_path = PROC_DIR / "predictions" / "summary_all_baselines_lags.csv"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         df_sum.to_csv(out_path, index=False)
         print(f"\nSaved summary to {out_path}")

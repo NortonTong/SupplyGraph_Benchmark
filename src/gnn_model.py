@@ -1,7 +1,9 @@
+# gnn_model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GINConv
+
 
 class GCNNodeRegressor(nn.Module):
     def __init__(self, in_channels, hidden_channels=64, out_channels=1, num_layers=3, dropout=0.1):
@@ -20,6 +22,7 @@ class GCNNodeRegressor(nn.Module):
             x = F.dropout(x, p=self.dropout, training=self.training)
         out = self.lin_out(x).squeeze(-1)  # [N]
         return out
+
 
 class GINNodeRegressor(nn.Module):
     def __init__(self, in_channels, hidden_channels=64, out_channels=1, num_layers=3, dropout=0.1):

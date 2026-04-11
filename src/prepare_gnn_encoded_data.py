@@ -3,10 +3,9 @@ import pandas as pd
 import numpy as np
 import torch
 from pathlib import Path
+from config.config import (PROJECT_ROOT, DATA_DIR, PROC_DIR, LAG_WINDOWS)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-PROC_DIR = DATA_DIR / "processed"
+
 OUT_DIR = PROC_DIR / "gnn"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -16,13 +15,14 @@ from train_xgboost import (
     prepare_features,
 )
 
-def build_encoded_table(horizon: int) -> pd.DataFrame:
-    # dùng đúng dataset baseline_1 (đã filter và có split, target = y_h{h})
-    df = load_dataset(horizon=horizon, variant="baseline_1", graph_variant=None)
 
-    # encode như XGBoost (train/val/test cùng schema)
+def build_encoded_table(horizon: int, lag_window: int | None = None) -> pd.DataFrame:
+    if lag_window is None:
+        lag_window = LAG_WINDOWS[0]
+
+    df = load_dataset(horizon=horizon, lag_window=lag_window)
+
     df_train_enc, df_val_enc, df_test_enc = one_hot_encode_train_val_test(df)
-
     df_enc = pd.concat([df_train_enc, df_val_enc, df_test_enc], ignore_index=True)
     df_enc = df_enc.sort_values(["date", "node_id"]).reset_index(drop=True)
     return df_enc
@@ -97,7 +97,6 @@ def get_day_split_from_encoded(df_enc: pd.DataFrame):
     return day_split
 
 def main():
-    # encode theo baseline_1 (horizon=1 cũng được, vì features giống nhau)
     df_enc = build_encoded_table(horizon=1)
     df_base = load_base_with_labels()
 

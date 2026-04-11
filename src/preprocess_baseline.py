@@ -4,7 +4,7 @@ import networkx as nx
 from pathlib import Path
 from config.config import (
     NODE_DIR, TEMPORAL_DIR, PROC_DIR, EDGE_DIR,
-    TRAIN_RATIO, VAL_RATIO, TEST_RATIO, LAG_WINDOW
+    TRAIN_RATIO, VAL_RATIO, TEST_RATIO, LAG_WINDOWS
 )
 pd.set_option("display.max_columns", None) 
 pd.set_option("display.width", 0)  
@@ -96,7 +96,7 @@ def load_raw_data() -> pd.DataFrame:
     )
     return df
 
-def add_lag_features(df: pd.DataFrame, lag_cols: list[str], max_lag: int = LAG_WINDOW) -> pd.DataFrame:
+def add_lag_features(df: pd.DataFrame, lag_cols: list[str], max_lag: int) -> pd.DataFrame:
     df = df.sort_values(["node_id", "day"]).copy()
     for col in lag_cols:
         for lag in range(max_lag):
@@ -191,7 +191,13 @@ def compute_graph_stats(edge_file: Path,
         f"{edge_type}_closeness": [closeness[n] for n in deg.keys()],
         f"{edge_type}_betweenness": [betweenness[n] for n in deg.keys()],
     })
-
+    stat_cols = [
+        f"{edge_type}_deg",
+        f"{edge_type}_clustering",
+        f"{edge_type}_closeness",
+        f"{edge_type}_betweenness",
+    ]
+    df_stats[stat_cols] = df_stats[stat_cols].fillna(0.0)
     df_idx = pd.read_csv(node_index_file).rename(
         columns={"Node": "node_id", "NodeIndex": "node_index"}
     )
@@ -233,21 +239,34 @@ def merge_all_graph_stats(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-def build_xgboost_datasets() -> None:
+def build_xgboost_datasets_for_window(lag_window: int) -> None:
+    print(f"\n=== Building baseline datasets for lag_window={lag_window} ===")
+
     df = load_raw_data()
+
     lag_cols = ["sales_order", "production", "delivery", "factory_issue"]
-    df = add_lag_features(df, lag_cols, max_lag=LAG_WINDOW)
-    df = add_rolling_stats(df, ["sales_order", "production", "delivery", "factory_issue"], window=7)
+    df = add_lag_features(df, lag_cols, max_lag=lag_window)
+    df = add_rolling_stats(
+        df,
+        ["sales_order", "production", "delivery", "factory_issue"],
+        window=7,
+    )
     df = add_calendar_features(df)
     df = create_labels(df)
     df = assign_splits(df)
     df = filter_valid_samples(df)
 
     PROC_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(PROC_DIR / "xgboost_base_filtered.parquet", index=False)
+    # Base filtered (không graph) nếu bạn muốn debug
+    df.to_parquet(
+        PROC_DIR / f"xgboost_base_filtered_lag{lag_window}.parquet",
+        index=False,
+    )
 
+    # Graph stats (fillna(0) bạn đã thêm ở compute_graph_stats)
     load_graph_stats()
     df = merge_all_graph_stats(df)
+
     feature_cols = [
         c for c in df.columns
         if any(
@@ -265,29 +284,40 @@ def build_xgboost_datasets() -> None:
     out_dir = PROC_DIR / "baseline"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Đặt tên file có suffix lag_window, ví dụ xgboost_h1_lag7.parquet
     df_h1 = df[base_cols + feature_cols + ["y_h1"]].rename(columns={"y_h1": "target"})
     df_h7 = df[base_cols + feature_cols + ["y_h7"]].rename(columns={"y_h7": "target"})
-    
-    df_h1.to_parquet(out_dir / "xgboost_h1.parquet", index=False)
-    df_h7.to_parquet(out_dir / "xgboost_h7.parquet", index=False)
-    print(f"Saved baseline datasets with horizon 1 to {out_dir} / xgboost_h1.parquet")
-    print(f"Saved baseline datasets with horizon 7 to {out_dir} / xgboost_h7.parquet")
 
-    df_h1.to_csv(out_dir / "xgboost_h1_full.csv", index=False)
-    df_h7.to_csv(out_dir / "xgboost_h7_full.csv", index=False)
+    df_h1.to_parquet(out_dir / f"xgboost_h1_lag{lag_window}.parquet", index=False)
+    df_h7.to_parquet(out_dir / f"xgboost_h7_lag{lag_window}.parquet", index=False)
 
-    print(f"Saved H=1 CSV to {out_dir / 'xgboost_h1_full.csv'}")
-    print(f"Saved H=7 CSV to {out_dir / 'xgboost_h7_full.csv'}")
-    
-    print("\n=== Columns in baseline H=1 ===")
+    print(f"Saved baseline H=1 to {out_dir} / xgboost_h1_lag{lag_window}.parquet")
+    print(f"Saved baseline H=7 to {out_dir} / xgboost_h7_lag{lag_window}.parquet")
+
+    df_h1.to_csv(out_dir / f"xgboost_h1_lag{lag_window}_full.csv", index=False)
+    df_h7.to_csv(out_dir / f"xgboost_h7_lag{lag_window}_full.csv", index=False)
+
+    print(f"Saved H=1 CSV to {out_dir / f'xgboost_h1_lag{lag_window}_full.csv'}")
+    print(f"Saved H=7 CSV to {out_dir / f'xgboost_h7_lag{lag_window}_full.csv'}")
+
+    print("\n=== Columns in baseline H=1 (lag_window={}) ===".format(lag_window))
     print(list(df_h1.columns))
 
-    print("\n=== Columns in baseline H=7 ===")
+    print("\n=== Columns in baseline H=7 (lag_window={}) ===".format(lag_window))
     print(list(df_h7.columns))
 
-
 def main() -> None:
-    build_xgboost_datasets()
+    # Đọc list lag window từ config: LAG_WINDOWS = [7, 14, 21]
+    for lag_w in LAG_WINDOWS:
+        build_xgboost_datasets_for_window(lag_w)
+
+
+if __name__ == "__main__":
+    main()
+
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
