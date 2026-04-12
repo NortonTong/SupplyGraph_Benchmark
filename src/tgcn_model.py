@@ -1,169 +1,83 @@
-# models_tgcn.py
+# tgcn_model.py
+
 import torch
-from torch import nn
+import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
+
+
+class TGCNCell(nn.Module):
+    """
+    Một bước T-GCN như paper:
+      - GCN để lấy spatial features.
+      - GRU-like gates (r, u, c) để cập nhật hidden state.
+    """
+    def __init__(self, in_channels, gcn_hidden, gru_hidden):
+        super().__init__()
+        self.gcn = GCNConv(in_channels, gcn_hidden)
+
+        # GRU gates: reset, update, candidate
+        self.W_r = nn.Linear(gcn_hidden + gru_hidden, gru_hidden)
+        self.W_u = nn.Linear(gcn_hidden + gru_hidden, gru_hidden)
+        self.W_c = nn.Linear(gcn_hidden + gru_hidden, gru_hidden)
+
+    def forward(self, x_t, h_prev, edge_index):
+        """
+        x_t:     [N, F_in]
+        h_prev:  [N, H]  (hidden state trước đó)
+        edge_index: [2, E]
+        return:
+          h_t: [N, H]
+        """
+        # 1) GCN cho spatial thông tin
+        z_t = self.gcn(x_t, edge_index)      # [N, gcn_hidden]
+        z_t = F.relu(z_t)
+
+        # 2) GRU-like update
+        # concat input và hidden trước đó
+        xh = torch.cat([z_t, h_prev], dim=-1)  # [N, gcn_hidden + H]
+
+        r_t = torch.sigmoid(self.W_r(xh))      # reset gate
+        u_t = torch.sigmoid(self.W_u(xh))      # update gate
+
+        xh_candidate = torch.cat([z_t, r_t * h_prev], dim=-1)
+        c_t = torch.tanh(self.W_c(xh_candidate))  # candidate state
+
+        h_t = u_t * h_prev + (1.0 - u_t) * c_t
+        return h_t
 
 
 class TGCN(nn.Module):
     """
-    X: [B, L, N, F]
-    edge_index: [2, E]
-    Output: [B, pre_len, N]
+    T-GCN đơn giản:
+      - Input: chuỗi X_seq [T, N, F] (T bước lịch sử), một edge_index cố định.
+      - Unroll TGCNCell theo thời gian để thu được h_T cho mỗi node.
+      - Dùng h_T qua một Linear => dự đoán y_hat [N] cho horizon tương ứng.
     """
-
-    def __init__(
-        self,
-        num_nodes: int,
-        in_channels: int,
-        hidden_channels: int = 64,
-        gcn_layers: int = 1,
-        pre_len: int = 1,
-    ):
+    def __init__(self, in_channels, gcn_hidden=64, gru_hidden=64, horizon=1):
         super().__init__()
-        self.num_nodes = num_nodes
-        self.in_channels = in_channels
-        self.hidden_channels = hidden_channels
-        self.pre_len = pre_len
+        self.horizon = horizon
+        self.cell = TGCNCell(in_channels, gcn_hidden, gru_hidden)
+        self.out_layer = nn.Linear(gru_hidden, 1)
 
-        # GCN stack (áp dụng cho từng bước thời gian)
-        convs = []
-        for i in range(gcn_layers):
-            in_ch = in_channels if i == 0 else hidden_channels
-            convs.append(GCNConv(in_ch, hidden_channels))
-        self.convs = nn.ModuleList(convs)
-
-        # GRU trên chuỗi thời gian, feature size = N * hidden_channels
-        self.gru = nn.GRU(
-            input_size=num_nodes * hidden_channels,
-            hidden_size=num_nodes * hidden_channels,
-            num_layers=1,
-            batch_first=True,
-        )
-
-        # Linear ra pre_len * N
-        self.fc = nn.Linear(num_nodes * hidden_channels, pre_len * num_nodes)
-
-    def forward(self, x, edge_index):
+    def forward(self, x_seq, edge_index):
         """
-        x: [B, L, N, F]
+        x_seq: [T, N, F]  (chuỗi input lịch sử)
         edge_index: [2, E]
+        Output: [N] (dự đoán cho horizon tương ứng)
         """
-        B, L, N, F = x.shape
-        assert N == self.num_nodes
+        T, N, Fdim = x_seq.shape
+        device = x_seq.device
 
-        gcn_outputs = []
-        for t in range(L):
-            x_t = x[:, t]           # [B, N, F]
-            x_t = x_t.reshape(B * N, F)
-            for conv in self.convs:
-                x_t = conv(x_t, edge_index)  # [B*N, H]
-                x_t = torch.relu(x_t)
-            x_t = x_t.reshape(B, N, self.hidden_channels)
-            gcn_outputs.append(x_t)
+        # init hidden state = 0 như repo gốc
+        H = self.cell.W_r.out_features
+        h = torch.zeros(N, H, device=device)
 
-        h_seq = torch.stack(gcn_outputs, dim=1)  # [B, L, N, H]
-        h_seq = h_seq.reshape(B, L, N * self.hidden_channels)
+        # unroll theo thời gian
+        for t in range(T):
+            x_t = x_seq[t]         # [N, F]
+            h = self.cell(x_t, h, edge_index)  # [N, H]
 
-        gru_out, _ = self.gru(h_seq)            # [B, L, N*H]
-        last = gru_out[:, -1, :]                # [B, N*H]
-
-        out = self.fc(last)                     # [B, pre_len * N]
-        out = out.view(B, self.pre_len, N)      # [B, pre_len, N]
-        return out
-    
-# models_tgcn.py (phiên bản multi-view)
-import torch
-from torch import nn
-from torch_geometric.nn import GCNConv
-
-
-class MultiViewTGCN(nn.Module):
-    """
-    X: [B, L, N, F]
-    edge_index_dict: dict[str, edge_index], 4 view
-    Output: [B, pre_len, N]
-    """
-
-    def __init__(
-        self,
-        num_nodes: int,
-        in_channels: int,
-        hidden_channels: int = 32,
-        gcn_layers: int = 1,
-        pre_len: int = 1,
-        views=("plant", "product_group", "sub_group", "storage"),
-        fusion="concat",  # "concat" hoặc "sum"
-    ):
-        super().__init__()
-        self.num_nodes = num_nodes
-        self.in_channels = in_channels
-        self.hidden_channels = hidden_channels
-        self.pre_len = pre_len
-        self.views = views
-        self.fusion = fusion
-
-        # GCN stack per view
-        self.view_convs = nn.ModuleDict()
-        for v in views:
-            convs = []
-            for i in range(gcn_layers):
-                in_ch = in_channels if i == 0 else hidden_channels
-                convs.append(GCNConv(in_ch, hidden_channels))
-            self.view_convs[v] = nn.ModuleList(convs)
-
-        # fusion dim
-        if fusion == "concat":
-            fusion_dim = hidden_channels * len(views)
-        else:  # "sum"
-            fusion_dim = hidden_channels
-
-        # GRU: feature size = N * fusion_dim
-        self.gru = nn.GRU(
-            input_size=num_nodes * fusion_dim,
-            hidden_size=num_nodes * fusion_dim,
-            num_layers=1,
-            batch_first=True,
-        )
-
-        # Linear ra pre_len * N
-        self.fc = nn.Linear(num_nodes * fusion_dim, pre_len * num_nodes)
-
-    def forward(self, x, edge_index_dict):
-        """
-        x: [B, L, N, F]
-        edge_index_dict: {view_name: edge_index}
-        """
-        B, L, N, F = x.shape
-        assert N == self.num_nodes
-
-        gcn_outputs = []
-        for t in range(L):
-            x_t = x[:, t]  # [B, N, F]
-            x_t = x_t.reshape(B * N, F)
-
-            view_feats = []
-            for v in self.views:
-                h_v = x_t
-                for conv in self.view_convs[v]:
-                    h_v = conv(h_v, edge_index_dict[v])  # [B*N, H]
-                    h_v = torch.relu(h_v)
-                h_v = h_v.reshape(B, N, self.hidden_channels)
-                view_feats.append(h_v)                 # [B, N, H]
-
-            if self.fusion == "concat":
-                h_t = torch.cat(view_feats, dim=-1)     # [B, N, H*V]
-            else:  # "sum"
-                h_t = torch.stack(view_feats, dim=0).sum(dim=0)  # [B, N, H]
-
-            gcn_outputs.append(h_t)
-
-        h_seq = torch.stack(gcn_outputs, dim=1)         # [B, L, N, fusion_dim]
-        fusion_dim = h_seq.shape[-1]
-        h_seq = h_seq.reshape(B, L, N * fusion_dim)
-
-        gru_out, _ = self.gru(h_seq)                   # [B, L, N*fusion_dim]
-        last = gru_out[:, -1, :]                       # [B, N*fusion_dim]
-
-        out = self.fc(last)                            # [B, pre_len * N]
-        out = out.view(B, self.pre_len, N)             # [B, pre_len, N]
-        return out
+        # sau khi đi hết chuỗi, dùng h_T để dự đoán
+        y_hat = self.out_layer(h).squeeze(-1)  # [N]
+        return y_hat
