@@ -11,5 +11,5 @@ PROC_DIR = DATA_DIR / "processed"
 TRAIN_RATIO = 0.6
 VAL_RATIO = 0.2
 TEST_RATIO = 0.2
-
-LAG_WINDOWS = [7, 14, 30] 
+TEMPORAL_TYPE = ["unit", "weight"]
+LAG_WINDOWS = [7]

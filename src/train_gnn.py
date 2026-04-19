@@ -1,302 +1,918 @@
-# train_gnn_ablation.py
-
 import torch
-import torch.nn.functional as F
-from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader
+from torch import nn
 import numpy as np
 import pandas as pd
+from pathlib import Path
 import matplotlib.pyplot as plt
 
-from config.config import PROC_DIR
-from gnn_model import GCNNodeRegressor, GINNodeRegressor
+from models_gnn import (
+    ProjectedGINRegressor,
+    HomogeneousFiveTypeGINRegressor,
+    HeterogeneousGINRegressor,
+)
+from config.config import PROC_DIR, TEMPORAL_TYPE
 
 
-GNN_DIR = PROC_DIR / "gnn"
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+RUN_SUMMARY = []
+
+HORIZON = 7
+LAG_WINDOWS = [7, 14]
+PROJECTED_VIEWS = ["same_group", "same_subgroup", "same_plant", "same_storage"]
 
 
-def build_dataset_multi_view(horizon: int, edge_types: list[str]):
-    """
-    Build dataset GNN cho 1 horizon, với nhiều loại edge (multi-view).
-    Gộp tất cả cạnh lại (union) thành một edge_index chung.
-    """
-    pkg = torch.load(GNN_DIR / "gnn_data_encoded.pt", weights_only=False)
+# =========================
+# EarlyStopping helper
+# =========================
 
-    X = pkg["X"].clone()  # [T, N, F]
-    if horizon == 1:
-        Y = pkg["Y_h1"]  # [T, N]
-    elif horizon == 7:
-        Y = pkg["Y_h7"]
+class EarlyStopping:
+    def __init__(self, patience: int = 5, min_delta: float = 0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_score = None
+        self.counter = 0
+        self.early_stop = False
+        self.best_state_dict = None
+
+    def step(self, val_loss: float, model: nn.Module) -> bool:
+        score = -val_loss
+        if self.best_score is None:
+            self.best_score = score
+            self.best_state_dict = {
+                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+            }
+            self.counter = 0
+            return False
+
+        if score > self.best_score + self.min_delta:
+            self.best_score = score
+            self.best_state_dict = {
+                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+            }
+            self.counter = 0
+        else:
+            self.counter += 1
+
+        if self.counter >= self.patience:
+            self.early_stop = True
+            return True
+        return False
+
+    def load_best(self, model: nn.Module):
+        if self.best_state_dict is not None:
+            model.load_state_dict(self.best_state_dict)
+
+
+# =========================
+# Target transform helpers (chỉ dùng raw)
+# =========================
+
+def transform_target(y: torch.Tensor, mode: str) -> torch.Tensor:
+    if mode == "raw":
+        return y
     else:
-        raise ValueError(f"Unsupported horizon: {horizon}")
+        raise ValueError(f"Only 'raw' target is supported, got mode={mode}")
 
-    days = pkg["days"]          # [T]
-    splits = pkg["split"]       # np.array[str] shape [T]
 
-    # --- normalize feature theo train days ---
-    train_mask_t = (splits == "train")
-    X_train = X[train_mask_t]   # [T_train, N, F]
-    X_train_flat = X_train.reshape(-1, X.shape[-1])
+def inverse_transform_target(y_pred: np.ndarray, mode: str) -> np.ndarray:
+    if mode == "raw":
+        return y_pred
+    else:
+        raise ValueError(f"Only 'raw' target is supported, got mode={mode}")
 
-    mask = ~torch.isnan(X_train_flat)
-    counts = mask.sum(dim=0).clamp(min=1)
-    X_zero = torch.where(mask, X_train_flat, torch.zeros_like(X_train_flat))
 
-    mean = X_zero.sum(dim=0) / counts
-    diff = torch.where(mask, X_train_flat - mean, torch.zeros_like(X_train_flat))
-    var = (diff * diff).sum(dim=0) / counts
-    std = torch.sqrt(var) + 1e-6
+# =========================
+# Helper chung
+# =========================
 
-    X = (X - mean) / std
+def load_gnn_pkg(graph_type: str, temporal_type: str, lag_window: int, horizon: int = 7):
+    if graph_type == "projected":
+        name = f"gnn_projected_h{horizon}_lag{lag_window}_{temporal_type}.pt"
+    elif graph_type == "homo5":
+        name = f"gnn_homo5_h{horizon}_lag{lag_window}_{temporal_type}.pt"
+    elif graph_type == "hetero5":
+        name = f"gnn_hetero5_h{horizon}_lag{lag_window}_{temporal_type}.pt"
+    else:
+        raise ValueError(f"Unknown graph_type={graph_type}")
 
-    # --- load edges cho nhiều view, union lại ---
-    edges_path = GNN_DIR / "edge_index_views.pt"
-    if not edges_path.exists():
-        raise FileNotFoundError(
-            f"{edges_path} not found. Run build_edge_index.py first."
-        )
-    edges_all = torch.load(edges_path)
+    path = Path(PROC_DIR) / "gnn" / name
+    print(f"[LOAD] {path}")
+    pkg = torch.load(path, map_location="cpu",weights_only = False)
+    return pkg
 
-    edge_list = []
-    for et in edge_types:
-        if et not in edges_all:
-            raise KeyError(f"edge_type '{et}' not found in edge_index_views.pt")
-        edge_list.append(edges_all[et].long())
 
-    edge_cat = torch.cat(edge_list, dim=1)           # [2, sum_E]
-    edge_index = torch.unique(edge_cat, dim=1)       # bỏ cạnh trùng
+def get_time_splits(days, split):
+    idx_train = [t for t in range(len(days)) if split[t] == "train"]
+    idx_val = [t for t in range(len(days)) if split[t] == "val"]
+    idx_test = [t for t in range(len(days)) if split[t] == "test"]
+    print(f"[SPLIT] train={len(idx_train)}, val={len(idx_val)}, test={len(idx_test)}")
+    return idx_train, idx_val, idx_test
 
-    T, N, Fdim = X.shape
+
+def mape(y_true, y_pred, eps=1e-8):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    mask = np.abs(y_true) > eps
+    if mask.sum() == 0:
+        return np.nan
+    return float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100.0)
+
+
+def smape(y_true, y_pred, eps=1e-8):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true = y_true[mask]
+    y_pred = y_pred[mask]
+    denom = (np.abs(y_true) + np.abs(y_pred)) + eps
+    return float(np.mean(2.0 * np.abs(y_pred - y_true) / denom) * 100.0)
+
+
+def mae(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    return float(np.mean(np.abs(y_true - y_pred)))
+
+
+def rmse(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+
+
+# =========================
+# Plot time series target theo product
+# =========================
+
+def plot_product_time_series(pkg, temporal_type: str, lag_window: int, max_products: int = 20):
+    """
+    Vẽ time series target theo từng product từ Y_product và days.
+    Lưu PNG dưới PROC_DIR/predictions/gnn_baselines/plots/.
+    """
+    Y_prod = pkg["Y_product"].float().numpy()  # [T, N_prod]
+    days = np.array(pkg["days"])
+    T, N_prod = Y_prod.shape
+
+    n = min(N_prod, max_products)
+    n_cols = 4
+    n_rows = int(np.ceil(n / n_cols))
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3 * n_rows), sharex=True)
+    axes = axes.flatten()
+
+    for i in range(n):
+        ax = axes[i]
+        ax.plot(days, Y_prod[:, i], lw=1.0)
+        ax.set_title(f"Product {i}")
+        ax.tick_params(axis="x", rotation=45)
+
+    for j in range(n, len(axes)):
+        axes[j].axis("off")
+
+    fig.suptitle(
+        f"Product demand time series (temporal={temporal_type}, lag={lag_window})",
+        fontsize=14,
+    )
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    out_dir = Path(PROC_DIR) / "predictions" / "gnn_baselines" / "plots"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"ts_products_{temporal_type}_lag{lag_window}.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+    print(f"[PLOT] Saved product time series plot to {out_path}")
+
+
+# =========================
+# 1) Projected GNN baseline
+# =========================
+
+def run_projected_gnn_baseline(
+    pkg,
+    temporal_type: str,
+    lag_window: int,
+    edge_view: str,
+    device: str = "cuda",
+    epochs: int = 30,
+    batch_days: int = 8,
+    es_patience: int = 5,
+    es_min_delta: float = 0.0,
+    target_transform: str = "raw",       # chỉ 'raw'
+    clip_pred: bool = True,             # clip 0 khi compute metric
+    use_softplus_output: bool = False,  # softplus ở output
+):
+    tag_mode = f"{target_transform}{'_clip' if clip_pred else '_noclip'}"
     print(
-        f"[DEBUG] multi-view {edge_types}, N={N}, "
-        f"edge_index_min={int(edge_index.min())}, edge_index_max={int(edge_index.max())}, "
-        f"edges={edge_index.size(1)}"
+        f"\n=== Training Projected GNN Baseline "
+        f"[H{HORIZON}][lag{lag_window}][{temporal_type}][view={edge_view}] "
+        f"[mode={tag_mode}][softplus={use_softplus_output}] ==="
     )
 
-    assert int(edge_index.max()) < N, "edge_index has node index out of range for X"
+    X = pkg["X_product"].float()  # [T, N, F]
+    Y = pkg["Y_product"].float()  # [T, N]
+    days = pkg["days"]
+    split = pkg["split"]
+    edge_index_dict = pkg["edge_index_dict"]
 
-    data_train, data_val, data_test = [], [], []
+    if edge_view not in edge_index_dict:
+        raise ValueError(f"edge_view={edge_view} not in {list(edge_index_dict.keys())}")
+    edge_index = edge_index_dict[edge_view]
 
-    for t in range(T):
-        x_t = X[t]  # [N, F]
-        y_t = Y[t]  # [N]
+    T, N, Fdim = X.shape
+    idx_train, idx_val, idx_test = get_time_splits(days, split)
 
-        x_t = torch.nan_to_num(x_t, nan=0.0, posinf=0.0, neginf=0.0)
-        if torch.all(torch.isnan(y_t)):
-            continue
+    device = device if (device == "cuda" and torch.cuda.is_available()) else "cpu"
+    model = ProjectedGINRegressor(
+        in_channels=Fdim,
+        hidden_channels=128,
+        num_layers=3,
+        use_softplus_output=use_softplus_output,
+    ).to(device)
+    edge_index = edge_index.to(device)
 
-        data = Data(x=x_t, edge_index=edge_index, y=y_t)
-        data.day = days[t]
-        split = splits[t]
-        if split == "train":
-            data_train.append(data)
-        elif split == "val":
-            data_val.append(data)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn = nn.MSELoss()
+    early_stopper = EarlyStopping(patience=es_patience, min_delta=es_min_delta)
+
+    def iterate_days(day_indices, train_mode=True):
+        if train_mode:
+            model.train()
         else:
-            data_test.append(data)
+            model.eval()
+        total_loss = 0.0
+        count = 0
 
-    return data_train, data_val, data_test
+        for start in range(0, len(day_indices), batch_days):
+            idx_block = day_indices[start:start + batch_days]
+            X_block = X[idx_block].to(device)
+            Y_block = Y[idx_block].to(device)
 
+            loss_block = 0.0
+            for b in range(X_block.size(0)):
+                x_b = X_block[b]        # [N, F]
+                y_b = Y_block[b]        # [N]
+                y_b_t = transform_target(y_b, target_transform)
 
-def train_epoch(model, loader, optimizer):
-    model.train()
-    total_loss, count = 0.0, 0
-    for data in loader:
-        data = data.to(DEVICE)
-        optimizer.zero_grad()
-        out = model(data.x, data.edge_index)  # [N]
-        mask = ~torch.isnan(data.y)
-        if mask.sum() == 0:
-            continue
-        loss = F.mse_loss(out[mask], data.y[mask])
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-        count += 1
-    return total_loss / max(count, 1)
+                y_hat_b = model(x_b, edge_index)
+                loss_b = loss_fn(y_hat_b, y_b_t)
+                loss_block += loss_b
 
+            loss_block = loss_block / X_block.size(0)
+            if train_mode:
+                opt.zero_grad()
+                loss_block.backward()
+                opt.step()
 
-@torch.no_grad()
-def eval_epoch(model, loader):
-    model.eval()
-    all_true, all_pred = [], []
-    for data in loader:
-        data = data.to(DEVICE)
-        out = model(data.x, data.edge_index)
-        mask = ~torch.isnan(data.y)
-        y_true = data.y[mask]
-        y_pred = out[mask]
-        if y_true.numel() == 0:
-            continue
-        all_true.append(y_true.cpu())
-        all_pred.append(y_pred.cpu())
-    if not all_true:
-        return float("nan"), float("nan")
-    y_true = torch.cat(all_true)
-    y_pred = torch.cat(all_pred)
-    mae = torch.mean(torch.abs(y_pred - y_true)).item()
-    rmse = torch.sqrt(torch.mean((y_pred - y_true) ** 2)).item()
-    return mae, rmse
+            total_loss += loss_block.item()
+            count += 1
 
+        return total_loss / max(count, 1)
 
-@torch.no_grad()
-def predict_and_save(model, loader, horizon: int, variant_tag: str):
-    model.eval()
-    rows = []
-    for data in loader:
-        data = data.to(DEVICE)
-        out = model(data.x, data.edge_index)
-        y_true = data.y.cpu().numpy()
-        y_pred = out.cpu().numpy()
-        day_val = int(data.day.item())
-        for node_idx, (yt, yp) in enumerate(zip(y_true, y_pred)):
-            rows.append(
-                {
-                    "day": day_val,
-                    "node_index": node_idx,
-                    "y_true": float(yt),
-                    "y_pred": float(yp),
-                }
-            )
-    df_pred = pd.DataFrame(rows)
-    out_dir = PROC_DIR / "predictions_gnn_ablation" / variant_tag
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / f"gnn_h{horizon}_test_predictions.csv"
-    df_pred.to_csv(out_file, index=False)
-    print(f"Saved predictions to {out_file}")
-
-
-def plot_history(history, tag: str, horizon: int):
-    """
-    history: dict với key 'epoch', 'train_loss', 'val_mae', 'val_rmse'
-    """
-    out_dir = PROC_DIR / "predictions_gnn_ablation" / tag
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    epochs = history["epoch"]
-    train_loss = history["train_loss"]
-    val_mae = history["val_mae"]
-    val_rmse = history["val_rmse"]
-
-    # Train loss
-    plt.figure(figsize=(6, 4))
-    plt.plot(epochs, train_loss, label="train_loss")
-    plt.xlabel("epoch")
-    plt.ylabel("loss")
-    plt.title(f"{tag} H{horizon} - train loss")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_dir / f"{tag}_H{horizon}_train_loss.png")
-    plt.close()
-
-    # Val MAE & RMSE
-    plt.figure(figsize=(6, 4))
-    plt.plot(epochs, val_mae, label="val_mae")
-    plt.plot(epochs, val_rmse, label="val_rmse")
-    plt.xlabel("epoch")
-    plt.ylabel("metric")
-    plt.title(f"{tag} H{horizon} - val metrics")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_dir / f"{tag}_H{horizon}_val_metrics.png")
-    plt.close()
-
-
-def train_one_gnn_variant(
-    horizon: int,
-    edge_types: list[str],
-    model_cls,
-    tag: str,
-):
-    """
-    Train một model GNN (GCN/GIN) với 1 tập edge_types (multi-view),
-    giống như một variant baseline_2/baseline_3.
-    """
-    train_set, val_set, test_set = build_dataset_multi_view(horizon, edge_types=edge_types)
-
-    train_loader = DataLoader(train_set, batch_size=1, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=1, shuffle=False)
-    test_loader = DataLoader(test_set, batch_size=1, shuffle=False)
-
-    in_channels = train_set[0].x.shape[1]
-    model = model_cls(in_channels=in_channels, hidden_channels=64, num_layers=3).to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
-
-    best_rmse, best_state = float("inf"), None
-    patience, wait = 20, 0
-    max_epochs = 400
-
-    history = {"epoch": [], "train_loss": [], "val_mae": [], "val_rmse": []}
-
-    for epoch in range(1, max_epochs + 1):
-        train_loss = train_epoch(model, train_loader, opt)
-        val_mae, val_rmse = eval_epoch(model, val_loader)
-
-        history["epoch"].append(epoch)
-        history["train_loss"].append(train_loss)
-        history["val_mae"].append(val_mae)
-        history["val_rmse"].append(val_rmse)
-
-        improved = val_rmse < best_rmse - 1e-3
-        if improved:
-            best_rmse = val_rmse
-            best_state = model.state_dict()
-            wait = 0
-        else:
-            wait += 1
-
-        if epoch % 20 == 0 or improved:
-            print(
-                f"[H{horizon}][{tag}] Epoch {epoch} "
-                f"train_loss={train_loss:.4f} val_mae={val_mae:.4f} val_rmse={val_rmse:.4f}"
-            )
-
-        if wait >= patience:
-            print(
-                f"[H{horizon}][{tag}] Early stopping at epoch {epoch}, "
-                f"best_val_rmse={best_rmse:.4f}"
-            )
+    for epoch in range(1, epochs + 1):
+        train_loss = iterate_days(idx_train, train_mode=True)
+        val_loss = iterate_days(idx_val, train_mode=False)
+        print(
+            f"[Projected-{edge_view}][{tag_mode}] Epoch {epoch:03d} | "
+            f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f}"
+        )
+        if early_stopper.step(val_loss, model):
+            print(f"[Projected-{edge_view}][{tag_mode}] Early stopping at epoch {epoch:03d}")
             break
 
-    plot_history(history, tag=tag, horizon=horizon)
+    early_stopper.load_best(model)
+    model.eval()
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    test_mae, test_rmse = eval_epoch(model, test_loader)
-    print(f"[H{horizon}][{tag}] Test MAE={test_mae:.4f} RMSE={test_rmse:.4f}")
-    predict_and_save(model, test_loader, horizon, variant_tag=tag)
+    with torch.no_grad():
+        def predict_on_indices(idxs):
+            preds_t = []
+            trues = []
+            for t in idxs:
+                x_t = X[t].to(device)
+                y_t = Y[t].to(device)
+                y_hat_t = model(x_t, edge_index)   # [N]
+                preds_t.append(y_hat_t.cpu().numpy())
+                trues.append(y_t.cpu().numpy())
+            return np.concatenate(trues), np.concatenate(preds_t)
+
+        y_train_true, y_train_pred_t = predict_on_indices(idx_train)
+        y_val_true, y_val_pred_t = predict_on_indices(idx_val)
+        y_test_true, y_test_pred_t = predict_on_indices(idx_test)
+
+    y_train_pred = inverse_transform_target(y_train_pred_t, target_transform)
+    y_val_pred = inverse_transform_target(y_val_pred_t, target_transform)
+    y_test_pred = inverse_transform_target(y_test_pred_t, target_transform)
+
+    if clip_pred:
+        y_train_pred = np.maximum(y_train_pred, 0.0)
+        y_val_pred = np.maximum(y_val_pred, 0.0)
+        y_test_pred = np.maximum(y_test_pred, 0.0)
+
+    mae_train = mae(y_train_true, y_train_pred)
+    rmse_train = rmse(y_train_true, y_train_pred)
+    mape_train = mape(y_train_true, y_train_pred)
+    smape_train = smape(y_train_true, y_train_pred)
+
+    mae_val = mae(y_val_true, y_val_pred)
+    rmse_val = rmse(y_val_true, y_val_pred)
+    mape_val = mape(y_val_true, y_val_pred)
+    smape_val = smape(y_val_true, y_val_pred)
+
+    mae_test = mae(y_test_true, y_test_pred)
+    rmse_test = rmse(y_test_true, y_test_pred)
+    mape_test = mape(y_test_true, y_test_pred)
+    smape_test = smape(y_test_true, y_test_pred)
+
+    tag = f"gnn_projected_{edge_view}_lag{lag_window}_{temporal_type}_{tag_mode}{'_sp' if use_softplus_output else ''}"
+    print(f"\n[Projected-{edge_view}][{tag}] Train:")
+    print(f"  MAE  : {mae_train:.4f}")
+    print(f"  RMSE : {rmse_train:.4f}")
+    print(f"  MAPE : {mape_train:.4f}")
+    print(f"  sMAPE: {smape_train:.4f}")
+
+    print(f"\n[Projected-{edge_view}][{tag}] Val:")
+    print(f"  MAE  : {mae_val:.4f}")
+    print(f"  RMSE : {rmse_val:.4f}")
+    print(f"  MAPE : {mape_val:.4f}")
+    print(f"  sMAPE: {smape_val:.4f}")
+
+    print(f"\n[Projected-{edge_view}][{tag}] Test:")
+    print(f"  MAE  : {mae_test:.4f}")
+    print(f"  RMSE : {rmse_test:.4f}")
+    print(f"  MAPE : {mape_test:.4f}")
+    print(f"  sMAPE: {smape_test:.4f}")
+
+    RUN_SUMMARY.append(
+        {
+            "temporal_type": temporal_type,
+            "lag_window": lag_window,
+            "horizon": HORIZON,
+            "variant": "gnn_projected",
+            "tag": tag,
+            "edge_view": edge_view,
+            "target_transform": target_transform,
+            "clip_pred": clip_pred,
+            "use_softplus_output": use_softplus_output,
+            "MAE_train": mae_train,
+            "RMSE_train": rmse_train,
+            "MAPE_train": mape_train,
+            "sMAPE_train": smape_train,
+            "MAE_val": mae_val,
+            "RMSE_val": rmse_val,
+            "MAPE_val": mape_val,
+            "sMAPE_val": smape_val,
+            "MAE_test": mae_test,
+            "RMSE_test": rmse_test,
+            "MAPE_test": mape_test,
+            "sMAPE_test": smape_test,
+        }
+    )
 
 
-def main():
-    # Giống baseline_2: các cấu hình edge_type khác nhau
-    gnn_settings = {
-        "GNN_plant": ["plant"],
-        "GNN_group": ["product_group"],
-        "GNN_subgroup": ["sub_group"],
-        "GNN_storage": ["storage_location"],
-        "GNN_plant_group": ["plant", "product_group"],
-        "GNN_plant_subgroup": ["plant", "sub_group"],
-        "GNN_plant_storage": ["plant", "storage_location"],
-        "GNN_all4": ["plant", "product_group", "sub_group", "storage_location"],
+# =========================
+# 2) Homogeneous 5-type GNN baseline
+# =========================
+
+def run_homo5_gnn_baseline(
+    pkg,
+    temporal_type: str,
+    lag_window: int,
+    device: str = "cuda",
+    epochs: int = 30,
+    batch_days: int = 8,
+    es_patience: int = 5,
+    es_min_delta: float = 0.0,
+    target_transform: str = "raw",
+    clip_pred: bool = True,
+    use_softplus_output: bool = False,
+):
+    tag_mode = f"{target_transform}{'_clip' if clip_pred else '_noclip'}"
+    print(
+        f"\n=== Training Homogeneous-5type GNN Baseline "
+        f"[H{HORIZON}][lag{lag_window}][{temporal_type}] "
+        f"[mode={tag_mode}][softplus={use_softplus_output}] ==="
+    )
+
+    X_prod = pkg["X_product"].float()
+    Y_prod = pkg["Y_product"].float()
+    days = pkg["days"]
+    split = pkg["split"]
+    edge_index_dict = pkg["edge_index_dict"]
+    num_nodes_dict = pkg["num_nodes_dict"]
+
+    node_type_order = list(num_nodes_dict.keys())
+
+    offsets = {}
+    offset = 0
+    for nt in node_type_order:
+        offsets[nt] = offset
+        offset += num_nodes_dict[nt]
+    N_total = offset
+
+    all_edges = []
+    for (src_type, rel_name, dst_type), ei in edge_index_dict.items():
+        if ei.numel() == 0:
+            continue
+        src_offset = offsets[src_type]
+        dst_offset = offsets[dst_type]
+        src_global = ei[0, :] + src_offset
+        dst_global = ei[1, :] + dst_offset
+        all_edges.append(torch.stack([src_global, dst_global], dim=0))
+        all_edges.append(torch.stack([dst_global, src_global], dim=0))
+
+    if len(all_edges) == 0:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+    else:
+        edge_index = torch.cat(all_edges, dim=1)
+
+    print(f"[Homo5] N_total={N_total}, edges={edge_index.size(1)}")
+
+    T, N_prod, Fdim = X_prod.shape
+    idx_train, idx_val, idx_test = get_time_splits(days, split)
+
+    device = device if (device == "cuda" and torch.cuda.is_available()) else "cpu"
+    model = HomogeneousFiveTypeGINRegressor(
+        in_channels=Fdim,
+        num_nodes_dict=num_nodes_dict,
+        node_type_order=node_type_order,
+        hidden_channels=128,
+        num_layers=3,
+        node_type_emb_dim=8,
+        use_softplus_output=use_softplus_output,
+    ).to(device)
+    edge_index = edge_index.to(device)
+
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn = nn.MSELoss()
+
+    other_types = [nt for nt in node_type_order if nt != "product"]
+    early_stopper = EarlyStopping(patience=es_patience, min_delta=es_min_delta)
+
+    def iterate_days(day_indices, train_mode=True):
+        if train_mode:
+            model.train()
+        else:
+            model.eval()
+        total_loss = 0.0
+        count = 0
+
+        for start in range(0, len(day_indices), batch_days):
+            idx_block = day_indices[start:start + batch_days]
+            X_block = X_prod[idx_block].to(device)
+            Y_block = Y_prod[idx_block].to(device)
+
+            loss_block = 0.0
+            for b in range(X_block.size(0)):
+                x_prod_b = X_block[b]
+                y_b = Y_block[b]
+                y_b_t = transform_target(y_b, target_transform)
+
+                x_dict = {
+                    "product": x_prod_b,
+                    **{
+                        nt: torch.zeros(num_nodes_dict[nt], Fdim, device=device)
+                        for nt in other_types
+                    },
+                }
+
+                y_hat_b = model(x_dict, edge_index)
+                loss_b = loss_fn(y_hat_b, y_b_t)
+                loss_block += loss_b
+
+            loss_block = loss_block / X_block.size(0)
+            if train_mode:
+                opt.zero_grad()
+                loss_block.backward()
+                opt.step()
+
+            total_loss += loss_block.item()
+            count += 1
+
+        return total_loss / max(count, 1)
+
+    for epoch in range(1, epochs + 1):
+        train_loss = iterate_days(idx_train, train_mode=True)
+        val_loss = iterate_days(idx_val, train_mode=False)
+        print(f"[Homo5][{tag_mode}] Epoch {epoch:03d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f}")
+
+        if early_stopper.step(val_loss, model):
+            print(f"[Homo5][{tag_mode}] Early stopping at epoch {epoch:03d}")
+            break
+
+    early_stopper.load_best(model)
+    model.eval()
+
+    with torch.no_grad():
+        def predict_on_indices(idxs):
+            preds_t = []
+            trues = []
+            for t in idxs:
+                x_prod_t = X_prod[t].to(device)
+                y_t = Y_prod[t].to(device)
+                x_dict_t = {
+                    "product": x_prod_t,
+                    **{
+                        nt: torch.zeros(num_nodes_dict[nt], Fdim, device=device)
+                        for nt in other_types
+                    },
+                }
+                y_hat_t = model(x_dict_t, edge_index)
+                preds_t.append(y_hat_t.cpu().numpy())
+                trues.append(y_t.cpu().numpy())
+            return np.concatenate(trues), np.concatenate(preds_t)
+
+        y_train_true, y_train_pred_t = predict_on_indices(idx_train)
+        y_val_true, y_val_pred_t = predict_on_indices(idx_val)
+        y_test_true, y_test_pred_t = predict_on_indices(idx_test)
+
+    y_train_pred = inverse_transform_target(y_train_pred_t, target_transform)
+    y_val_pred = inverse_transform_target(y_val_pred_t, target_transform)
+    y_test_pred = inverse_transform_target(y_test_pred_t, target_transform)
+
+    if clip_pred:
+        y_train_pred = np.maximum(y_train_pred, 0.0)
+        y_val_pred = np.maximum(y_val_pred, 0.0)
+        y_test_pred = np.maximum(y_test_pred, 0.0)
+
+    mae_train = mae(y_train_true, y_train_pred)
+    rmse_train = rmse(y_train_true, y_train_pred)
+    mape_train = mape(y_train_true, y_train_pred)
+    smape_train = smape(y_train_true, y_train_pred)
+
+    mae_val = mae(y_val_true, y_val_pred)
+    rmse_val = rmse(y_val_true, y_val_pred)
+    mape_val = mape(y_val_true, y_val_pred)
+    smape_val = smape(y_val_true, y_val_pred)
+
+    mae_test = mae(y_test_true, y_test_pred)
+    rmse_test = rmse(y_test_true, y_test_pred)
+    mape_test = mape(y_test_true, y_test_pred)
+    smape_test = smape(y_test_true, y_test_pred)
+
+    tag = f"gnn_homo5_lag{lag_window}_{temporal_type}_{tag_mode}{'_sp' if use_softplus_output else ''}"
+
+    print(f"\n[Homo5][{tag}] Train:")
+    print(f"  MAE  : {mae_train:.4f}")
+    print(f"  RMSE : {rmse_train:.4f}")
+    print(f"  MAPE : {mape_train:.4f}")
+    print(f"  sMAPE: {smape_train:.4f}")
+
+    print(f"\n[Homo5][{tag}] Val:")
+    print(f"  MAE  : {mae_val:.4f}")
+    print(f"  RMSE : {rmse_val:.4f}")
+    print(f"  MAPE : {mape_val:.4f}")
+    print(f"  sMAPE: {smape_val:.4f}")
+
+    print(f"\n[Homo5][{tag}] Test:")
+    print(f"  MAE  : {mae_test:.4f}")
+    print(f"  RMSE : {rmse_test:.4f}")
+    print(f"  MAPE : {mape_test:.4f}")
+    print(f"  sMAPE: {smape_test:.4f}")
+
+    RUN_SUMMARY.append(
+        {
+            "temporal_type": temporal_type,
+            "lag_window": lag_window,
+            "horizon": HORIZON,
+            "variant": "gnn_homo5",
+            "tag": tag,
+            "edge_view": None,
+            "target_transform": target_transform,
+            "clip_pred": clip_pred,
+            "use_softplus_output": use_softplus_output,
+            "MAE_train": mae_train,
+            "RMSE_train": rmse_train,
+            "MAPE_train": mape_train,
+            "sMAPE_train": smape_train,
+            "MAE_val": mae_val,
+            "RMSE_val": rmse_val,
+            "MAPE_val": mape_val,
+            "sMAPE_val": smape_val,
+            "MAE_test": mae_test,
+            "RMSE_test": rmse_test,
+            "MAPE_test": mape_test,
+            "sMAPE_test": smape_test,
+        }
+    )
+
+
+# =========================
+# 3) Heterogeneous 5-type GNN baseline
+# =========================
+
+def run_hetero5_gnn_baseline(
+    pkg,
+    temporal_type: str,
+    lag_window: int,
+    device: str = "cuda",
+    epochs: int = 30,
+    batch_days: int = 8,
+    es_patience: int = 5,
+    es_min_delta: float = 0.0,
+    target_transform: str = "raw",
+    clip_pred: bool = True,
+    use_softplus_output: bool = False,
+):
+    tag_mode = f"{target_transform}{'_clip' if clip_pred else '_noclip'}"
+    print(
+        f"\n=== Training Heterogeneous-5type GNN Baseline "
+        f"[H{HORIZON}][lag{lag_window}][{temporal_type}] "
+        f"[mode={tag_mode}][softplus={use_softplus_output}] ==="
+    )
+
+    X_prod = pkg["X_product"].float()
+    Y_prod = pkg["Y_product"].float()
+    days = pkg["days"]
+    split = pkg["split"]
+    edge_index_dict = pkg["edge_index_dict"]
+    num_nodes_dict = pkg["num_nodes_dict"]
+
+    idx_train, idx_val, idx_test = get_time_splits(days, split)
+    T, N_prod, Fdim = X_prod.shape
+
+    edge_types = list(edge_index_dict.keys())
+    in_channels_dict = {"edge_types": edge_types, "product": Fdim}
+    other_types = [nt for nt in num_nodes_dict.keys() if nt != "product"]
+    for nt in other_types:
+        in_channels_dict[nt] = Fdim
+
+    device = device if (device == "cuda" and torch.cuda.is_available()) else "cpu"
+    model = HeterogeneousGINRegressor(
+        in_channels_dict=in_channels_dict,
+        hidden_channels=128,
+        num_layers=2,
+        use_softplus_output=use_softplus_output,
+    ).to(device)
+    edge_index_dict = {k: v.to(device) for k, v in edge_index_dict.items()}
+
+    base_x_dict = {
+        nt: torch.zeros(num_nodes_dict[nt], Fdim) for nt in num_nodes_dict.keys()
     }
 
-    for h in [1, 7]:
-        for tag, ets in gnn_settings.items():
-            # GCN
-            train_one_gnn_variant(
-                horizon=h,
-                edge_types=ets,
-                model_cls=GCNNodeRegressor,
-                tag=f"{tag}_GCN",
-            )
-            # GIN
-            train_one_gnn_variant(
-                horizon=h,
-                edge_types=ets,
-                model_cls=GINNodeRegressor,
-                tag=f"{tag}_GIN",
-            )
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn = nn.MSELoss()
+    early_stopper = EarlyStopping(patience=es_patience, min_delta=es_min_delta)
+
+    def iterate_days(day_indices, train_mode=True):
+        if train_mode:
+            model.train()
+        else:
+            model.eval()
+
+        total_loss = 0.0
+        count = 0
+        for start in range(0, len(day_indices), batch_days):
+            idx_block = day_indices[start:start + batch_days]
+            X_block = X_prod[idx_block].to(device)
+            Y_block = Y_prod[idx_block].to(device)
+
+            loss_block = 0.0
+            for b in range(X_block.size(0)):
+                x_prod_b = X_block[b]
+                y_b = Y_block[b]
+                y_b_t = transform_target(y_b, target_transform)
+
+                x_dict = {nt: base_x_dict[nt].to(device) for nt in base_x_dict.keys()}
+                x_dict["product"] = x_prod_b
+
+                y_hat_b = model(x_dict, edge_index_dict)
+                loss_b = loss_fn(y_hat_b, y_b_t)
+                loss_block += loss_b
+
+            loss_block = loss_block / X_block.size(0)
+            if train_mode:
+                opt.zero_grad()
+                loss_block.backward()
+                opt.step()
+
+            total_loss += loss_block.item()
+            count += 1
+
+        return total_loss / max(count, 1)
+
+    for epoch in range(1, epochs + 1):
+        train_loss = iterate_days(idx_train, train_mode=True)
+        val_loss = iterate_days(idx_val, train_mode=False)
+        print(f"[Hetero5][{tag_mode}] Epoch {epoch:03d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f}")
+
+        if early_stopper.step(val_loss, model):
+            print(f"[Hetero5][{tag_mode}] Early stopping at epoch {epoch:03d}")
+            break
+
+    early_stopper.load_best(model)
+    model.eval()
+
+    with torch.no_grad():
+        def predict_on_indices(idxs):
+            preds_t = []
+            trues = []
+            for t in idxs:
+                x_prod_t = X_prod[t].to(device)
+                y_t = Y_prod[t].to(device)
+
+                x_dict = {nt: base_x_dict[nt].to(device) for nt in base_x_dict.keys()}
+                x_dict["product"] = x_prod_t
+
+                y_hat_t = model(x_dict, edge_index_dict)
+                preds_t.append(y_hat_t.cpu().numpy())
+                trues.append(y_t.cpu().numpy())
+            return np.concatenate(trues), np.concatenate(preds_t)
+
+        y_train_true, y_train_pred_t = predict_on_indices(idx_train)
+        y_val_true, y_val_pred_t = predict_on_indices(idx_val)
+        y_test_true, y_test_pred_t = predict_on_indices(idx_test)
+
+    y_train_pred = inverse_transform_target(y_train_pred_t, target_transform)
+    y_val_pred = inverse_transform_target(y_val_pred_t, target_transform)
+    y_test_pred = inverse_transform_target(y_test_pred_t, target_transform)
+
+    if clip_pred:
+        y_train_pred = np.maximum(y_train_pred, 0.0)
+        y_val_pred = np.maximum(y_val_pred, 0.0)
+        y_test_pred = np.maximum(y_test_pred, 0.0)
+
+    mae_train = mae(y_train_true, y_train_pred)
+    rmse_train = rmse(y_train_true, y_train_pred)
+    mape_train = mape(y_train_true, y_train_pred)
+    smape_train = smape(y_train_true, y_train_pred)
+
+    mae_val = mae(y_val_true, y_val_pred)
+    rmse_val = rmse(y_val_true, y_val_pred)
+    mape_val = mape(y_val_true, y_val_pred)
+    smape_val = smape(y_val_true, y_val_pred)
+
+    mae_test = mae(y_test_true, y_test_pred)
+    rmse_test = rmse(y_test_true, y_test_pred)
+    mape_test = mape(y_test_true, y_test_pred)
+    smape_test = smape(y_test_true, y_test_pred)
+
+    tag = f"gnn_hetero5_lag{lag_window}_{temporal_type}_{tag_mode}{'_sp' if use_softplus_output else ''}"
+
+    print(f"\n[Hetero5][{tag}] Train:")
+    print(f"  MAE  : {mae_train:.4f}")
+    print(f"  RMSE : {rmse_train:.4f}")
+    print(f"  MAPE : {mape_train:.4f}")
+    print(f"  sMAPE: {smape_train:.4f}")
+
+    print(f"\n[Hetero5][{tag}] Val:")
+    print(f"  MAE  : {mae_val:.4f}")
+    print(f"  RMSE : {rmse_val:.4f}")
+    print(f"  MAPE : {mape_val:.4f}")
+    print(f"  sMAPE: {smape_val:.4f}")
+
+    print(f"\n[Hetero5][{tag}] Test:")
+    print(f"  MAE  : {mae_test:.4f}")
+    print(f"  RMSE : {rmse_test:.4f}")
+    print(f"  MAPE : {mape_test:.4f}")
+    print(f"  sMAPE: {smape_test:.4f}")
+
+    RUN_SUMMARY.append(
+        {
+            "temporal_type": temporal_type,
+            "lag_window": lag_window,
+            "horizon": HORIZON,
+            "variant": "gnn_hetero5",
+            "tag": tag,
+            "edge_view": None,
+            "target_transform": target_transform,
+            "clip_pred": clip_pred,
+            "use_softplus_output": use_softplus_output,
+            "MAE_train": mae_train,
+            "RMSE_train": rmse_train,
+            "MAPE_train": mape_train,
+            "sMAPE_train": smape_train,
+            "MAE_val": mae_val,
+            "RMSE_val": rmse_val,
+            "MAPE_val": mape_val,
+            "sMAPE_val": smape_val,
+            "MAE_test": mae_test,
+            "RMSE_test": rmse_test,
+            "MAPE_test": mape_test,
+            "sMAPE_test": smape_test,
+        }
+    )
+
+
+# =========================
+# main: chạy 4 biến thể target + plot TS
+# =========================
+
+def main():
+    global RUN_SUMMARY
+    RUN_SUMMARY = []
+
+    temporal_types = TEMPORAL_TYPE
+
+    es_patience = 20
+    es_min_delta = 0.001
+
+    # 4 biến thể: raw_noclip, raw_clip, softplus_noclip, softplus_clip
+    target_setups = [
+        ("raw_noclip",   "raw", False, False),
+        ("raw_clip",     "raw", True,  False),
+        ("sp_noclip",    "raw", False, True),
+        ("sp_clip",      "raw", True,  True),
+    ]
+
+    for temporal_type in temporal_types:
+        for lag_window in LAG_WINDOWS:
+            print(f"\n############ GNN Baselines: temporal={temporal_type}, lag={lag_window} ############")
+
+            # 1) Projected – load, plot TS theo product, train 4 biến thể
+            pkg_proj = load_gnn_pkg("projected", temporal_type, lag_window)
+            plot_product_time_series(pkg_proj, temporal_type, lag_window, max_products=20)
+
+            for view in PROJECTED_VIEWS:
+                for tag_suffix, t_mode, do_clip, use_sp in target_setups:
+                    run_projected_gnn_baseline(
+                        pkg=pkg_proj,
+                        temporal_type=temporal_type,
+                        lag_window=lag_window,
+                        edge_view=view,
+                        device="cuda",
+                        epochs=300,
+                        batch_days=8,
+                        es_patience=es_patience,
+                        es_min_delta=es_min_delta,
+                        target_transform=t_mode,
+                        clip_pred=do_clip,
+                        use_softplus_output=use_sp,
+                    )
+
+            # 2) Homogeneous 5-type
+            pkg_homo5 = load_gnn_pkg("homo5", temporal_type, lag_window)
+            for tag_suffix, t_mode, do_clip, use_sp in target_setups:
+                run_homo5_gnn_baseline(
+                    pkg=pkg_homo5,
+                    temporal_type=temporal_type,
+                    lag_window=lag_window,
+                    device="cuda",
+                    epochs=300,
+                    batch_days=8,
+                    es_patience=es_patience,
+                    es_min_delta=es_min_delta,
+                    target_transform=t_mode,
+                    clip_pred=do_clip,
+                    use_softplus_output=use_sp,
+                )
+
+            # 3) Heterogeneous 5-type
+            pkg_hetero5 = load_gnn_pkg("hetero5", temporal_type, lag_window)
+            for tag_suffix, t_mode, do_clip, use_sp in target_setups:
+                run_hetero5_gnn_baseline(
+                    pkg=pkg_hetero5,
+                    temporal_type=temporal_type,
+                    lag_window=lag_window,
+                    device="cuda",
+                    epochs=300,
+                    batch_days=8,
+                    es_patience=es_patience,
+                    es_min_delta=es_min_delta,
+                    target_transform=t_mode,
+                    clip_pred=do_clip,
+                    use_softplus_output=use_sp,
+                )
+
+    if RUN_SUMMARY:
+        df_sum = pd.DataFrame(RUN_SUMMARY)
+        print("\n=== GNN baselines summary ===")
+        df_sum = df_sum.sort_values(
+            [
+                "temporal_type",
+                "lag_window",
+                "horizon",
+                "variant",
+                "tag",
+                "edge_view",
+                "target_transform",
+                "use_softplus_output",
+            ]
+        )
+        print(
+            df_sum[
+                [
+                    "temporal_type",
+                    "lag_window",
+                    "horizon",
+                    "variant",
+                    "tag",
+                    "edge_view",
+                    "target_transform",
+                    "clip_pred",
+                    "use_softplus_output",
+                    "MAE_train",
+                    "RMSE_train",
+                    "MAE_val",
+                    "RMSE_val",
+                    "MAE_test",
+                    "RMSE_test",
+                ]
+            ]
+        )
+
+        out_path = Path(PROC_DIR) / "predictions" / "gnn_baselines" / "summary_gnn_baselines_all_variants.csv"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        df_sum.to_csv(out_path, index=False)
+        print(f"\nSaved GNN baseline summary to {out_path}")
 
 
 if __name__ == "__main__":

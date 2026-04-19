@@ -8,10 +8,50 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-from config.config import PROC_DIR, LAG_WINDOWS
+from config.config import PROC_DIR
 
+# ====================== Metrics ======================
 
-# ================= EarlyStopping =================
+def mape(y_true, y_pred, eps=1e-8):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    mask = np.abs(y_true) > eps
+    if mask.sum() == 0:
+        return np.nan
+    return float(
+        np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100.0
+    )
+
+def smape(y_true, y_pred, eps=1e-8):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denom = (np.abs(y_true) + np.abs(y_pred)) + eps
+    return float(np.mean(2.0 * np.abs(y_pred - y_true) / denom) * 100.0)
+
+# ====================== Target transform ======================
+
+TARGET_TYPES = ["raw", "log1p"]
+
+def transform_target(y: np.ndarray, target_type: str) -> np.ndarray:
+    if target_type == "raw":
+        return y
+    elif target_type == "log1p":
+        # y >= 0, log1p ổn cho zero-inflated demand / outlier.[web:49][web:51]
+        return np.log1p(np.clip(y, a_min=0.0, a_max=None))
+    else:
+        raise ValueError(f"Unknown target_type={target_type}")
+
+def inverse_transform_target(y_hat: np.ndarray, target_type: str) -> np.ndarray:
+    if target_type == "raw":
+        y = y_hat
+    elif target_type == "log1p":
+        y = np.expm1(y_hat)
+    else:
+        raise ValueError(f"Unknown target_type={target_type}")
+    # đảm bảo không âm
+    return np.maximum(y, 0.0)
+
+# ====================== EarlyStopping ======================
 
 class EarlyStopping:
     def __init__(self, patience: int = 10, min_delta: float = 0.0):
@@ -41,8 +81,7 @@ class EarlyStopping:
 
         return False
 
-
-# ================= Dataset & Model =================
+# ====================== Dataset & Model ======================
 
 class GRUDataset(Dataset):
     def __init__(self, X, y):
@@ -54,7 +93,6 @@ class GRUDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
-
 
 class GRURegressor(nn.Module):
     def __init__(
@@ -86,16 +124,24 @@ class GRURegressor(nn.Module):
         y_hat = self.fc(last_hidden).squeeze(-1)
         return y_hat
 
+# ====================== Data utils ======================
 
-# ================= Data utils =================
+def load_baseline(
+    horizon: int,
+    temporal_type: str = "unit",
+) -> pd.DataFrame:
+    """
+    Dùng GRU base no-graph: baseline/gru_sequence_{temporal_type}.parquet
+    Horizon=7 => target gốc là 'target' (y_h7 trong preprocessing).
+    """
+    assert horizon == 7, "GRU preprocessing hiện chỉ hỗ trợ H=7."
 
-def load_baseline(horizon: int, lag_window: int | None = None) -> pd.DataFrame:
-    if lag_window is None:
-        lag_window = LAG_WINDOWS[0]
-
-    path = PROC_DIR / "baseline" / f"gru_ready_h{horizon}_lag{lag_window}.parquet"
-    print(f"Loading GRU-ready baseline from {path}")
+    path = PROC_DIR / "baseline" / f"gru_sequence_{temporal_type}.parquet"
+    print(f"Loading GRU base from {path}")
     df = pd.read_parquet(path)
+
+    df = df.copy()
+    df["target"] = df["target"].astype(float)
 
     num_cols = df.select_dtypes(include=["number", "bool"]).columns.tolist()
     df[num_cols] = df[num_cols].fillna(0.0)
@@ -107,6 +153,11 @@ def build_sequences(
     window: int,
     split: str = "train",
 ):
+    """
+    Tạo sequence (X, y) cho một split (train/val/test):
+    - X: (num_samples, window, num_features)
+    - y: (num_samples,)
+    """
     df_split = df[df["split"] == split].copy()
     df_split = df_split.sort_values(["node_id", "day"])
 
@@ -125,15 +176,13 @@ def build_sequences(
     ).columns.tolist()
     feature_cols = numeric_cols
 
-    # Log NaN theo cột trước dropna
+    # Debug NaN trước dropna
     na_counts = df_split[feature_cols + ["target"]].isna().sum()
     print(f"\n[DEBUG] {split} NaN counts BEFORE dropna:")
     print(na_counts[na_counts > 0])
 
-    # Bỏ các hàng có NaN trong feature hoặc target (sau khi fill 0, bước này chủ yếu là safety)
     df_split = df_split.dropna(subset=feature_cols + ["target"])
 
-    # Log lại sau dropna
     na_counts_after = df_split[feature_cols + ["target"]].isna().sum()
     print(f"[DEBUG] {split} NaN counts AFTER dropna (should be empty):")
     print(na_counts_after[na_counts_after > 0])
@@ -160,14 +209,16 @@ def build_sequences(
     X = np.stack(X_list, axis=0)
     y = np.asarray(y_list)
 
-    print("DEBUG build_sequences:", split,
-          "| X NaN:", np.isnan(X).sum(),
-          "X inf:", np.isinf(X).sum(),
-          "| y NaN:", np.isnan(y).sum(),
-          "y inf:", np.isinf(y).sum())
+    print(
+        "DEBUG build_sequences:",
+        split,
+        "| X NaN:", np.isnan(X).sum(),
+        "X inf:", np.isinf(X).sum(),
+        "| y NaN:", np.isnan(y).sum(),
+        "y inf:", np.isinf(y).sum(),
+    )
 
     return X, y, feature_cols
-
 
 def make_dataloaders(
     df: pd.DataFrame,
@@ -201,12 +252,10 @@ def make_dataloaders(
         (seq_len, input_size),
     )
 
-
-# ================= Training =================
+# ====================== Training (fixed split) ======================
 
 def train_one_gru(
     horizon: int,
-    lag_window: int,
     window: int,
     hidden_size: int = 128,
     num_layers: int = 2,
@@ -218,11 +267,20 @@ def train_one_gru(
     tag: str = "GRU",
     patience: int = 20,
     min_delta: float = 0.0,
+    temporal_type: str = "unit",
+    target_type: str = "raw",
 ):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    df = load_baseline(horizon=horizon, lag_window=lag_window)
+    df = load_baseline(
+        horizon=horizon,
+        temporal_type=temporal_type,
+    )
+
+    # Transform target trước khi build sequence (model học trên scale y')
+    df = df.copy()
+    df["target"] = transform_target(df["target"].values, target_type)
 
     (
         train_loader,
@@ -251,14 +309,15 @@ def train_one_gru(
     early_stopper = EarlyStopping(patience=patience, min_delta=min_delta)
 
     print(
-        f"\n=== Training GRU H{horizon} lag{lag_window} ({tag}) "
-        f"seq_len={seq_len}, n_features={input_size} ==="
+        f"\n=== Training GRU Baseline 2 H{horizon}, window={window}, target_type={target_type} "
+        f"({tag}, {temporal_type}) seq_len={seq_len}, n_features={input_size} ==="
     )
 
     for epoch in range(1, n_epochs + 1):
         # ---------- Train ----------
         model.train()
         train_losses = []
+        train_trues, train_preds = [], []
 
         for Xb, yb in train_loader:
             Xb = Xb.to(device)
@@ -268,63 +327,73 @@ def train_one_gru(
             y_pred = model(Xb)
             loss = criterion(y_pred, yb)
             loss.backward()
-
-            # optional: gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
             optimizer.step()
 
             train_losses.append(loss.item())
+            train_trues.append(yb.detach().cpu().numpy())
+            train_preds.append(y_pred.detach().cpu().numpy())
+
+        train_trues = np.concatenate(train_trues)
+        train_preds = np.concatenate(train_preds)
+
+        # inverse về scale gốc + clip
+        train_trues_inv = inverse_transform_target(train_trues, target_type)
+        train_preds_inv = inverse_transform_target(train_preds, target_type)
+
+        train_mask = np.isfinite(train_trues_inv) & np.isfinite(train_preds_inv)
+        train_trues_inv = train_trues_inv[train_mask]
+        train_preds_inv = train_preds_inv[train_mask]
+
+        if len(train_trues_inv) == 0:
+            train_rmse = np.nan
+            train_mae = np.nan
+            train_mape_val = np.nan
+            train_smape_val = np.nan
+        else:
+            train_rmse = sqrt(mean_squared_error(train_trues_inv, train_preds_inv))
+            train_mae = mean_absolute_error(train_trues_inv, train_preds_inv)
+            train_mape_val = mape(train_trues_inv, train_preds_inv)
+            train_smape_val = smape(train_trues_inv, train_preds_inv)
 
         # ---------- Validation ----------
         model.eval()
         val_preds, val_trues = [], []
 
         with torch.no_grad():
-            for i, (Xb, yb) in enumerate(val_loader):
-                X_np = Xb.numpy()
-                nan_mask = np.isnan(X_np)
-                if nan_mask.any():
-                    nan_per_feature = nan_mask.sum(axis=(0, 1))
-                    print(f"[VAL BATCH {i}] X NaN per feature (index:count):")
-                    for j, c in enumerate(feature_cols):
-                        if nan_per_feature[j] > 0:
-                            print(f"  {c}: {nan_per_feature[j]} NaNs")
-
+            for Xb, yb in val_loader:
                 Xb = Xb.to(device)
                 yb = yb.to(device)
                 y_pred = model(Xb)
-
                 val_preds.append(y_pred.cpu().numpy())
                 val_trues.append(yb.cpu().numpy())
 
         val_preds = np.concatenate(val_preds)
         val_trues = np.concatenate(val_trues)
 
-        # Lọc NaN/inf ở output (safety)
-        mask = np.isfinite(val_preds) & np.isfinite(val_trues)
-        val_preds = val_preds[mask]
-        val_trues = val_trues[mask]
+        val_trues_inv = inverse_transform_target(val_trues, target_type)
+        val_preds_inv = inverse_transform_target(val_preds, target_type)
 
-        if len(val_trues) == 0:
+        mask = np.isfinite(val_preds_inv) & np.isfinite(val_trues_inv)
+        val_preds_inv = val_preds_inv[mask]
+        val_trues_inv = val_trues_inv[mask]
+
+        if len(val_trues_inv) == 0:
             print("Warning: no valid validation samples after filtering NaNs.")
-            return model, {
-                "horizon": horizon,
-                "lag_window": lag_window,
-                "tag": tag,
-                "val_rmse": np.nan,
-                "test_rmse": np.nan,
-                "test_mae": np.nan,
-                "n_features": input_size,
-                "seq_len": seq_len,
-            }
-
-        val_rmse = sqrt(mean_squared_error(val_trues, val_preds))
-        val_mae = mean_absolute_error(val_trues, val_preds)
+            val_rmse = np.nan
+            val_mae = np.nan
+            val_mape_val = np.nan
+            val_smape_val = np.nan
+        else:
+            val_rmse = sqrt(mean_squared_error(val_trues_inv, val_preds_inv))
+            val_mae = mean_absolute_error(val_trues_inv, val_preds_inv)
+            val_mape_val = mape(val_trues_inv, val_preds_inv)
+            val_smape_val = smape(val_trues_inv, val_preds_inv)
 
         print(
             f"Epoch {epoch:03d} | "
             f"TrainLoss={np.mean(train_losses):.4f} | "
+            f"TrainRMSE={train_rmse:.4f} | TrainMAE={train_mae:.4f} | "
             f"ValRMSE={val_rmse:.4f} | ValMAE={val_mae:.4f}"
         )
 
@@ -352,59 +421,88 @@ def train_one_gru(
     test_preds = np.concatenate(test_preds)
     test_trues = np.concatenate(test_trues)
 
-    mask = np.isfinite(test_preds) & np.isfinite(test_trues)
-    test_preds = test_preds[mask]
-    test_trues = test_trues[mask]
+    test_trues_inv = inverse_transform_target(test_trues, target_type)
+    test_preds_inv = inverse_transform_target(test_preds, target_type)
 
-    if len(test_trues) == 0:
+    mask = np.isfinite(test_preds_inv) & np.isfinite(test_trues_inv)
+    test_preds_inv = test_preds_inv[mask]
+    test_trues_inv = test_trues_inv[mask]
+
+    if len(test_trues_inv) == 0:
         print("Warning: no valid test samples after filtering NaNs.")
         test_rmse = np.nan
         test_mae = np.nan
+        test_mape_val = np.nan
+        test_smape_val = np.nan
     else:
-        test_rmse = sqrt(mean_squared_error(test_trues, test_preds))
-        test_mae = mean_absolute_error(test_trues, test_preds)
+        test_rmse = sqrt(mean_squared_error(test_trues_inv, test_preds_inv))
+        test_mae = mean_absolute_error(test_trues_inv, test_preds_inv)
+        test_mape_val = mape(test_trues_inv, test_preds_inv)
+        test_smape_val = smape(test_trues_inv, test_preds_inv)
 
     print(
-        f"\n[GRU][H{horizon}][lag{lag_window}][{tag}] "
-        f"Test RMSE={test_rmse:.4f}, MAE={test_mae:.4f}"
+        f"\n[GRU Baseline 2][H{horizon}][window={window}][{target_type}][{tag}][{temporal_type}] "
+        f"Test RMSE={test_rmse:.4f}, MAE={test_mae:.4f}, "
+        f"MAPE={test_mape_val:.4f}, sMAPE={test_smape_val:.4f}"
     )
 
     # Lưu model
-    out_dir = PROC_DIR / "models" / "gru"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    model_path = out_dir / f"gru_h{horizon}_lag{lag_window}_{tag}.pth"
+    out_dir_model = PROC_DIR / "models" / "gru" / "baseline_2"
+    out_dir_model.mkdir(parents=True, exist_ok=True)
+    model_path = out_dir_model / f"gru_baseline2_h{horizon}_w{window}_{target_type}_{temporal_type}.pth"
     torch.save(
         {
             "state_dict": model.state_dict(),
             "horizon": horizon,
-            "lag_window": lag_window,
             "window": window,
             "input_size": input_size,
             "hidden_size": hidden_size,
             "num_layers": num_layers,
             "dropout": dropout,
             "feature_cols": feature_cols,
+            "temporal_type": temporal_type,
+            "target_type": target_type,
         },
         model_path,
     )
     print(f"Saved GRU model to {model_path}")
 
+    # Lưu test predictions (scale gốc)
+    out_dir_pred = PROC_DIR / "predictions" / "baseline_2" / "gru" / "csv" / temporal_type
+    out_dir_pred.mkdir(parents=True, exist_ok=True)
+    df_test_pred = pd.DataFrame({"y_true": test_trues_inv, "y_pred": test_preds_inv})
+    out_pred_file = out_dir_pred / f"gru_baseline2_h{horizon}_w{window}_{target_type}_{temporal_type}_test_predictions.csv"
+    df_test_pred.to_csv(out_pred_file, index=False)
+    print(f"Saved GRU test predictions to {out_pred_file}")
+
     info = {
         "horizon": horizon,
-        "lag_window": lag_window,
+        "window": window,
         "tag": tag,
+        "temporal_type": temporal_type,
+        "target_type": target_type,
+        "train_rmse": train_rmse,
+        "train_mae": train_mae,
+        "train_mape": train_mape_val,
+        "train_smape": train_smape_val,
         "val_rmse": best_val_rmse,
+        "val_mae": val_mae,
+        "val_mape": val_mape_val,
+        "val_smape": val_smape_val,
         "test_rmse": test_rmse,
         "test_mae": test_mae,
+        "test_mape": test_mape_val,
+        "test_smape": test_smape_val,
         "n_features": input_size,
         "seq_len": seq_len,
     }
 
     return model, info
 
+# ====================== Rolling-origin GRU ======================
+
 def rolling_origin_evaluation_gru(
     horizon: int,
-    lag_window: int,
     window: int,
     origins: list[int],
     hidden_size: int = 128,
@@ -414,24 +512,30 @@ def rolling_origin_evaluation_gru(
     n_epochs: int = 200,
     lr: float = 1e-3,
     device: str | None = None,
-    tag_prefix: str = "gru_rolling",
+    tag_prefix: str = "gru_baseline2_rolling",
     patience: int = 20,
     min_delta: float = 0.0,
+    temporal_type: str = "unit",
+    target_type: str = "raw",  # bạn có thể dùng "raw" hoặc "log1p"
 ):
-    """
-    Rolling-origin evaluation: với mỗi origin T, train GRU trên day <= T,
-    predict day = T + horizon, tính MAE/RMSE, rồi tổng hợp.
-    """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    df_full = load_baseline(horizon=horizon, lag_window=lag_window)
+    df_full = load_baseline(
+        horizon=horizon,
+        temporal_type=temporal_type,
+    )
+
+    # transform target để train (như fixed-split)
+    df_full = df_full.copy()
+    df_full["target"] = transform_target(df_full["target"].values, target_type)
+
     errors = []
 
     for T in origins:
-        print(f"\n=== GRU Rolling origin at day {T}, H={horizon}, lag={lag_window} ===")
+        print(f"\n=== GRU Baseline 2 Rolling origin at day {T}, H={horizon}, "
+              f"window={window}, temporal_type={temporal_type}, target_type={target_type} ===")
 
-        # Train: day <= T, Test: day == T + horizon
         df_train = df_full[df_full["day"] <= T].copy()
         df_test  = df_full[df_full["day"] == T + horizon].copy()
 
@@ -439,22 +543,22 @@ def rolling_origin_evaluation_gru(
             print(f"No test samples for origin {T} (day={T+horizon}). Skipping.")
             continue
 
-        # Build sequences riêng cho train & test (không dùng cột split)
         def build_seq_for_df(df_sub: pd.DataFrame, split_name: str):
-            # set split tạm để reuse build_sequences
             df_tmp = df_sub.copy()
             df_tmp["split"] = split_name
             X, y, feature_cols = build_sequences(df_tmp, window=window, split=split_name)
             return X, y, feature_cols
 
         X_train, y_train, feature_cols = build_seq_for_df(df_train, "train")
-        X_test,  y_test,  _            = build_seq_for_df(df_test,  "test")
+        X_test,  y_test,  _           = build_seq_for_df(df_test,  "test")
+
         if X_train is None or y_train is None:
             print(f"  Skip origin {T}: no train sequences.")
             continue
         if X_test is None or y_test is None:
             print(f"  Skip origin {T}: no test sequences (not enough history for window={window}).")
             continue
+
         train_ds = GRUDataset(X_train, y_train)
         test_ds  = GRUDataset(X_test, y_test)
 
@@ -472,7 +576,6 @@ def rolling_origin_evaluation_gru(
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         early_stopper = EarlyStopping(patience=patience, min_delta=min_delta)
 
-        # Train cho origin này
         for epoch in range(1, n_epochs + 1):
             model.train()
             train_losses = []
@@ -487,13 +590,11 @@ def rolling_origin_evaluation_gru(
                 optimizer.step()
                 train_losses.append(loss.item())
 
-            # simple early stopping trên train loss (vì không có val riêng)
             mean_loss = np.mean(train_losses)
             if early_stopper.step(mean_loss):
                 print(f"  Early stop at epoch {epoch}, train_loss={mean_loss:.4f}")
                 break
 
-        # Evaluate on test (day T + horizon)
         model.eval()
         test_preds, test_trues = [], []
         with torch.no_grad():
@@ -506,16 +607,20 @@ def rolling_origin_evaluation_gru(
         test_preds = np.concatenate(test_preds)
         test_trues = np.concatenate(test_trues)
 
-        mask = np.isfinite(test_preds) & np.isfinite(test_trues)
-        test_preds = test_preds[mask]
-        test_trues = test_trues[mask]
+        # inverse về scale gốc + clip
+        test_trues_inv = inverse_transform_target(test_trues, target_type)
+        test_preds_inv = inverse_transform_target(test_preds, target_type)
 
-        if len(test_trues) == 0:
+        mask = np.isfinite(test_preds_inv) & np.isfinite(test_trues_inv)
+        test_preds_inv = test_preds_inv[mask]
+        test_trues_inv = test_trues_inv[mask]
+
+        if len(test_trues_inv) == 0:
             print("  Warning: no valid test samples after filtering NaNs.")
             continue
 
-        mae = mean_absolute_error(test_trues, test_preds)
-        rmse = sqrt(mean_squared_error(test_trues, test_preds))
+        mae = mean_absolute_error(test_trues_inv, test_preds_inv)
+        rmse = sqrt(mean_squared_error(test_trues_inv, test_preds_inv))
 
         print(f"  MAE  : {mae:.4f}")
         print(f"  RMSE : {rmse:.4f}")
@@ -524,13 +629,13 @@ def rolling_origin_evaluation_gru(
 
     if errors:
         df_err = pd.DataFrame(errors)
-        print("\n=== GRU Rolling-origin summary ===")
+        print("\n=== GRU Baseline 2 Rolling-origin summary ===")
         print(df_err)
         print("\nAverage over origins:")
         print(df_err.mean(numeric_only=True))
 
-        out_dir = PROC_DIR / "predictions" / "gru" / "rolling"
+        out_dir = PROC_DIR / "predictions" / "baseline_2" / "gru" / "rolling"
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"gru_rolling_H{horizon}_lag{lag_window}.csv"
+        out_path = out_dir / f"gru_baseline2_rolling_H{horizon}_w{window}_{target_type}_{temporal_type}.csv"
         df_err.to_csv(out_path, index=False)
         print(f"\nSaved GRU rolling-origin results to {out_path}")

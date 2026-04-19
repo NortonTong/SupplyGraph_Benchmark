@@ -1,130 +1,230 @@
-# SupplyGraph Benchmark Skill
+# Skill: Writing SCGraph-Bench Paper (6-page IEEE, Double-Blind)
 
-## 1. Project Goal
+## 1. Scope of This Skill
 
-- Build a **benchmark** for demand forecasting on the SupplyGraph dataset: multi-node (SKU/plant), daily time series, with graph structure (plant, product group, etc).
-- Ensure **fair comparison** between:
-  - Tabular/time-series models (XGBoost, GRU, etc).
-  - Graph models (GCN, GIN, etc) using node features, lag features, and edges.
-- Provide a **reproducible pipeline**: same input, split, and metric, so all models are compared on the **same target** and **protocol**.
+This skill describes how to write a **6-page IEEE conference paper** (double-blind) for the project:
 
----
+> SCGraph-Bench: A Reproducible Benchmark for Graph Construction and Demand Forecasting in Supply Chains
 
+It encodes:
+- Target structure (sections, length per section).
+- Tone and level of detail.
+- How to integrate **graph construction**, **demand forecasting**, **GNNs**, and **benchmarking**.
+- Citation practices (only strong, accepted venues except for the few preprints we *explicitly* build on, like SupplyGraph).
 
-## 2. Data & Encoding
-
-### 2.0. Node ID Standard
-
-- The dataset contains exactly **40 original nodes**, defined in `NodesIndex.csv`.
-- Use both `node_id` (string, e.g. SKU code) and `node_index` (integer 0..39) as logical IDs.
-- **All graphs (edges) and embeddings are normalized to internal indices 0..39**.
-- Any mapping, edge, or embedding must use this 0..39 index order, matching the 40-row `df_meta`.
-
-### 2.1. Main File
-
-- `gnn_data_encoded.pt` (in `PROC_DIR/gnn`): shared tensor file for all GNNs:
-  - `X`: tensor `[T, N, F]` (T: days, N: nodes, F: features)
-  - `Y_h1`, `Y_h7`: target tensors `[T, N]` (horizon 1/7)
-  - `days`: `[T]` (day indices)
-  - `split`: `[T]` ("train"/"val"/"test" per day)
-  - `feature_cols`: feature names
-- **All models** (XGBoost, GRU, GCN, GIN, etc) must use the same target and split for fair comparison.
-
-
-### 2.2. Graph preprocessing / edge_index
-
-- All Edges (*.csv) use `node_index` in range 0..39.
-- When building `edge_index_views.pt`, node indices are mapped to positions 0..39 according to the order in the 40-row `df_meta` (from `NodesIndex.csv`).
-- Thus, every `edge_index` in the pipeline is always in [0, 39].
-### 2.3. preprocess_gnn.py: Node Embedding Generation
-
-- `preprocess_gnn.py` **does not train GNN forecasting models**.
-- Its role is to generate node embeddings for all 40 nodes using GCN/GIN encoders, for each of 4 graph views (plant, product_group, sub_group, storage_location).
-- The output is `gnn_node_embeddings_all_views.parquet`, containing embeddings for all nodes and all views.
-- These embeddings are then **merged as features into baseline models** (e.g., XGBoost) for fair comparison.
+Any agent using this skill should be able to:
+- Draft or revise sections of the paper.
+- Keep writing consistent with the agreed storyline and constraints.
+- Help shorten or expand text while preserving the core message.
 
 ---
 
-## 3. Evaluation Protocol (Do Not Change)
+## 2. Global Constraints
 
-### 3.1. Split
-- Split by **day** (T), not by node. All nodes at day `t` share the same split.
-- Keep this split for all models.
+1. **Format**
+   - IEEE conference format (`\documentclass[conference]{IEEEtran}`), two columns.
+   - Max **6 pages total**, including figures, tables, and references.
+   - Double-blind: no real author names, affiliations, or identifiable acknowledgments in the submission version.
 
-### 3.2. Mask NaN
-- `Y` may have NaN (nodes without target).
-- Do **not** drop snapshots with partial NaN; mask `~torch.isnan(y)` per snapshot for loss/metric.
-- All models must use the same masking.
+2. **Double-blind rules**
+   - Use `Anonymous Authors` and `Paper under double-blind review` in `\author`.
+   - No acknowledgments section in the review version.
+   - No self-identifying text: avoid “our lab at UIT”, “our industry partner”, etc.
+   - Code/data release: mention “we release code and data in an anonymous repository” without linking; add actual link only at camera-ready.
 
-### 3.3. Metric
-- Use **global MAE, global RMSE** (not per-snapshot average):
-  - Concatenate all `(y_true, y_pred)` for all days/nodes in the split (excluding NaN).
-  - Compute:
-    - `MAE = mean(|y_pred - y_true|)`
-    - `RMSE = sqrt(mean((y_pred - y_true)^2))`
-- Baselines (XGBoost/GRU) and GNNs must use **exactly** this method.
+3. **Citation policy**
+   - Prefer **accepted** conference/journal papers (NeurIPS, ICLR, KDD, IEEE/ACM journals, top operations/marketing journals).
+   - Exceptions:
+     - Survey GNN4TS preprint (if needed) and **SupplyGraph** preprint, because benchmark is built around it.
+   - No random arXiv unless:
+     - It’s SupplyGraph itself, or
+     - It’s a major survey where no peer-reviewed alternative exists.
+   - Citations should be **specific and accurate**: statements tied to the actual content of the cited paper, not generic claims.
 
----
-
-
-## 4. GNN Pipeline
-
-### 4.1. Models (`gnn_model.py`)
-- `GCNNodeRegressor`: multi-layer GCNConv, input `[N, F]`, output `[N]`.
-- `GINNodeRegressor`: multi-layer GINConv+MLP, input/output as above.
-- Both are **node regression** per snapshot (t), same as baselines.
-
-### 4.2. build_dataset (in `train_gnn.py`)
-- Load `gnn_data_encoded.pt`.
-- Select `Y_h1` or `Y_h7` by horizon.
-- **Normalize features using train days only** (mean/std per column, ignoring NaN).
-- Load `edge_index_full` from `edge_index_views.pt`.
-- Remap/trim `edge_index` to match nodes in `X` (shift to 0-based, mask out-of-range).
-- For each day `t`:
-  - `x_t = X[t]`, `y_t = Y[t]`, replace NaN/inf in `x_t` with 0.
-  - Skip snapshot if `y_t` is all NaN.
-  - Create `Data(x, edge_index, y)`, assign `data.day = days[t]`, append to train/val/test by split.
-- Result: 3 lists (`data_train`, `data_val`, `data_test`), each is a list of daily snapshots with the same graph.
-
-### 4.3. Train & Eval
-- `train_epoch`: loop over loader (batch_size=1), mask NaN in `y`, compute loss on valid nodes.
-- `eval_epoch`: collect all `y_true`, `y_pred` across batches, compute global MAE/RMSE.
-- Early stopping on `val_rmse`, save best state.
-- After training: evaluate on test, save metrics and predictions (CSV: day, node_index, y_true, y_pred).
-
-### 4.4. Plotting
-- Log `epoch`, `train_loss`, `val_mae`, `val_rmse`.
-- Plot and save learning curves in `PROC_DIR/predictions_gnn/{tag}/`.
-- All models must save metrics/curves in the same format for comparison.
+4. **Narrative priorities**
+   - Paper is **not** “new model SOTA”; it is:
+     - A **reproducible benchmark** (data + pipeline + protocol).
+     - A carefully controlled empirical study of **graph construction** + **graph usage** + **output parameterization**.
+   - Always foreground:
+     - Transparency of pipeline.
+     - Reproducibility of splits and evaluation.
+     - Strong baselines (XGBoost) as serious references.
+     - Domain specifics: zero-inflated, heavy-tailed demand; non-negativity constraints.
 
 ---
 
-## 5. Baselines & Fairness
+## 3. Target Paper Structure (6 Pages)
 
-When adding new models (e.g., GraphTransformer, TemporalGNN):
-1. Use the same `gnn_data_encoded.pt` (or equivalent) for input, target, and split.
-2. If using different normalization (batch/layer norm), still normalize input as in GNN pipeline for fairness.
-3. Use **global MAE/RMSE** and same NaN masking.
-4. Log test metrics and predictions in the same format/location (CSV: day, node_index, y_true, y_pred).
-5. Ensure all models predict the **same target** (e.g., `sold_qty_h1` at day t), no shifting.
+The paper should roughly follow this structure:
+
+1. **Abstract**
+   - 4–6 sentences.
+   - Mention:
+     - Supply chain demand forecasting is relational → graphs.
+     - Existing work (SupplyGraph) lacks fully transparent, reproducible pipeline and protocol.
+     - SCGraph-Bench: transparent preprocessing + constrained graph constructions + benchmark protocol.
+     - Empirical findings: XGBoost strong, but heterogeneous GNN + Softplus brings gains in certain regimes.
+
+2. **Introduction (~0.75–1 page)**
+   - Flow:
+     1. **Demand forecasting in supply chains**
+        - Role in FMCG, bullwhip effect (Lee et al.).
+        - Traditional models and ML; GBDT as strong baselines.
+     2. **Interacting products and supply chain network**
+        - Cross-effects between products (cross-elasticity, promotions).
+        - Shared plants, warehouses, and logistics → correlated shocks.
+        - This naturally defines a supply chain graph.
+     3. **GNNs in supply chain**
+        - GNNs for spatio-temporal forecasting.
+        - Specific accepted works: graph attention for supply chain demand, DeepHGNN for hierarchical time series.
+     4. **SupplyGraph**
+        - First public graph-structured dataset for supply chain planning with GNNs.
+        - Introduces multi-relational graph and initial GNN benchmarks.
+     5. **Gap**
+        - Pipeline from raw CSV → graph tensors not fully specified.
+        - Temporal splits, labels, and hyperparameter tuning not standardized.
+        - Hard to reproduce results or compare models fairly.
+        - Contrast with OGB, GraphBench, TimeRecipe.
+     6. **Contributions**
+        - 3 bullets:
+          - Transparent preprocessing and graph construction pipeline.
+          - Reproducible benchmark protocol (splits, baselines, metrics).
+          - Empirical study: graph-as-features vs graph-as-models + raw vs Softplus outputs on projected/homo/hetero graphs.
+
+3. **Related Work (~0.5–0.75 page)**  
+   Split into 3 subsections:
+
+   ### 3.1 Demand Forecasting in Supply Chains
+   - Briefly survey:
+     - Traditional forecasting (ARIMA, exponential smoothing).
+     - GBDT + hybrid TS models (cite 1–2 good 2024–2025 journal papers).
+     - Deep models for demand: RNNs/TCN/etc. (1 strong journal).
+   - Key points:
+     - GBDT (e.g., XGBoost) remains very strong when combined with lag/calendar features.
+     - Most works treat products/locations independently or in small groups; they do not fully exploit the supply chain graph.
+
+   ### 3.2 GNNs for Time Series and Supply Chains
+   - Two paragraphs:
+     - GNNs for spatio-temporal TS (traffic, sensors); possibly use GNN4TS survey (ACM Computing Surveys / arXiv).
+     - GNNs for supply chain / demand:
+       - Graph attention-based forecasting (ACM TMIS or similar).
+       - DeepHGNN in Expert Systems with Applications.
+       - Other GNN applications in production planning, risk.
+   - Key gap:
+     - These papers propose specific models on proprietary datasets.
+     - Lack of shared, standardized benchmark and baselines.
+
+   ### 3.3 Graph and Time-Series Benchmarks
+   - Describe:
+     - OGB (NeurIPS 2020) → datasets + standardized splits + loaders.
+     - GraphBench (KDD-level) → protocol design, hyperparameter search, threats to validity.
+     - TimeRecipe (ICLR 2026) → module-level benchmarking for time-series.
+   - Conclude:
+     - No analogous benchmark yet for **graph-based supply chain demand forecasting**.
+     - SupplyGraph is a dataset, but not a fully specified benchmark.
+     - SCGraph-Bench is meant to fill this gap.
+
+4. **The Proposed Benchmark Framework (~1–1.25 pages)**
+   - **Design Principles**: transparency, standardization, domain-awareness.
+   - **Data Pipeline & Temporal Splitting**:
+     - From raw CSV (nodes/edges/temporal) → `base_raw_unit.parquet` → `base_full_unit.parquet` → GNN `.pt` packages.
+     - Strict chronological splits; avoid leakage.
+   - **Task Definition**:
+     - Unit demand forecasting, horizon 7 days (H=7).
+     - Lags 7 and 14.
+     - Metrics: MAE, RMSE, MAPE, sMAPE.
+
+5. **Controlled Study: Graph Construction and Modeling (~1–1.25 pages)**
+   - **Graph Construction**:
+     - Projected product graphs (4 views).
+     - Homogeneous 5-type.
+     - Heterogeneous 5-type.
+   - **Graph-as-Features vs Graph-as-Models**:
+     - Graph features → XGBoost.
+     - End-to-end GNNs for each graph type.
+   - **Output Constraints**:
+     - Raw vs Softplus outputs for non-negativity on zero-inflated demand.
+
+6. **Experiments and Results (~1.5–2 pages)**
+   - **Setup**: hardware, software, hyperparameter search, splits.
+   - **Leaderboard**: one main table (Lag-7, maybe Lag-14).
+   - **Analysis**:
+     - XGBoost vs GRU vs GNN.
+     - Graph features vs GNN.
+     - Hetero vs Homo vs Projected.
+     - Raw vs Softplus: effect on MAPE/sMAPE.
+
+7. **Discussion and Conclusion (~0.5–0.75 page)**
+   - **Discussion / Threats to Validity**: single dataset, specific domain, some GNN configurations unstable at lag 14, etc.
+   - **Limitations**: models/datasets not covered.
+   - **Conclusion**: benchmark + insights; future directions.
 
 ---
 
-## 6. Guide for Agents/New Users
+## 4. Writing Style and Tone
 
-When adding/modifying a model:
-1. Read `gnn_data_encoded.pt` to understand dimensions and targets.
-2. Follow `build_dataset` for dataset definition, normalization, and split.
-3. Follow `train_one_model` for training loop, logging, early stopping, and saving outputs.
-4. **Do not** change split, metric calculation, or target definition. If protocol changes, create a new version and document it.
+- Audience: ML + supply-chain researchers at a reputable IEEE conference.
+- Tone:
+  - Precise, technical but readable.
+  - Avoid hype; focus on clarity and rigor.
+  - Highlight negative/neutral results honestly (e.g., “GRU did not outperform XGBoost under our setup”).
+
+- Do:
+  - Use clear topic sentences per paragraph.
+  - Use bullet lists sparingly, mainly for contributions and key findings.
+  - Keep math simple; only introduce formulas where they clarify (e.g., Softplus).
+
+- Don’t:
+  - Overclaim SOTA.
+  - Use informal language or domain-specific slang.
+  - Leak author identity or institution.
 
 ---
 
-## 7. TL;DR (for agent)
-- Standard dataset: `gnn_data_encoded.pt`.
-- Standard graph: `edge_index_views.pt`.
-- Split by day (not node).
-- Mask NaN in `y` for loss/metric.
-- Metric: **global MAE, global RMSE** over all (t, node) in test.
-- Save prediction CSV and learning curves for each model/horizon.
-- **Reuse this protocol** for new models to ensure fair, reproducible comparison.
+## 5. Citation Mapping (Canonical References)
+
+When the paper needs to:
+
+- **Motivate supply chain forecasting and bullwhip**:
+  - Cite Lee et al., MIT Sloan Mgmt Rev 1997.
+
+- **Discuss cross-product demand interactions**:
+  - Use classic retail / promotion papers in Journal of Marketing Research.
+
+- **Show GBDT strength for demand**:
+  - Use 1–2 recent Expert Systems with Applications / IJ-type papers comparing GBDT vs DL for demand.
+
+- **Show GNN success for supply chain demand**:
+  - `Supply Chain Demand Forecasting via Graph Attention Networks` (ACM TMIS or equivalent).
+  - `DeepHGNN` (Expert Systems with Applications, 2025).
+
+- **Refer to SupplyGraph**:
+  - Use its arXiv entry as the canonical dataset reference.
+
+- **Connect to benchmarks**:
+  - OGB (NeurIPS 2020).
+  - GraphBench (KDD-level).
+  - TimeRecipe (ICLR 2026).
+
+The skill assumes these references are already gathered and available in a `.bib` file or `thebibliography` environment.
+
+---
+
+## 6. How to Use This Skill
+
+When asked to “write” or “revise” a section of the SCGraph-Bench paper:
+
+1. Identify which section (e.g., Introduction, Related Work, Experiments).
+2. Use the structure and narrative described above to:
+   - Decide what content must be present.
+   - Respect length constraints.
+3. Use only the agreed reference set (or add new ones if they are:
+   - Accepted in strong venues,
+   - And directly relevant).
+4. Ensure the text remains anonymous and consistent with the global story:
+   - Transparent benchmark,
+   - Graph construction for supply chains,
+   - GNN vs XGBoost,
+   - Non-negativity and zero-inflation.
+
+This skill is specific to the SCGraph-Bench paper and should not be applied blindly to unrelated topics.
