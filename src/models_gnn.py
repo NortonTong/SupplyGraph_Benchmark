@@ -4,7 +4,18 @@ from torch_geometric.nn import GINConv
 from torch_geometric.nn import HeteroConv
 import torch.nn.functional as F
 
-
+def apply_output_head(head: torch.Tensor, is_softplus: bool, is_log1p: bool) -> torch.Tensor:
+    """
+    head: [N], logit từ Linear.
+    - is_softplus: y_hat = softplus(head)
+    - is_log1p :  y_hat = expm1(head).clamp_min(0)
+    - cả 2 False: y_hat = head
+    """
+    if is_softplus:
+        return F.softplus(head)
+    if is_log1p:
+        return torch.expm1(head).clamp_min(0.0)
+    return head
 # ============================================================
 # 1. GIN block dùng chung
 # ============================================================
@@ -30,8 +41,10 @@ class MLP(nn.Module):
 
 class ProjectedGINRegressor(nn.Module):
     """
-    GIN cho graph projected 1 node-type (product) với 1 edge_index.
-    Có thể bật use_softplus_output để đảm bảo output dương.
+    GIN cho projected product graph.
+    - is_softplus=True : y_hat = softplus(head)      (>=0)
+    - is_log1p=True   : y_hat = expm1(head).>=0
+    - cả 2 False      : y_hat = head (raw)
     """
 
     def __init__(
@@ -39,55 +52,56 @@ class ProjectedGINRegressor(nn.Module):
         in_channels: int,
         hidden_channels: int = 128,
         num_layers: int = 3,
-        use_softplus_output: bool = False,
+        is_softplus: bool = False,
+        is_log1p: bool = False,
     ):
         super().__init__()
-        self.use_softplus_output = use_softplus_output
+        if is_softplus and is_log1p:
+            raise ValueError("Only one of is_softplus / is_log1p can be True.")
+
+        self.is_softplus = is_softplus
+        self.is_log1p = is_log1p
 
         self.convs = nn.ModuleList()
-        # layer 1
-        self.convs.append(
-            GINConv(MLP(in_channels, hidden_channels))
-        )
-        # các layer tiếp theo
+        self.convs.append(GINConv(MLP(in_channels, hidden_channels)))
         for _ in range(num_layers - 1):
-            self.convs.append(
-                GINConv(MLP(hidden_channels, hidden_channels))
-            )
+            self.convs.append(GINConv(MLP(hidden_channels, hidden_channels)))
 
         self.out_lin = nn.Linear(hidden_channels, 1)
+
+        if self.is_softplus:
+            self.softplus = nn.Softplus()
 
     def forward(self, x, edge_index):
         """
         x: [N, F]
         edge_index: [2, E]
-        return: [N]
+        return: [N] y_hat trên scale gốc (raw/softplus/log1p-expm1)
         """
         h = x
         for conv in self.convs:
             h = conv(h, edge_index)
             h = F.relu(h)
 
-        out = self.out_lin(h).squeeze(-1)  # [N]
-        if self.use_softplus_output:
-            # Softplus: z' = log(1 + exp(z))
-            out = F.softplus(out)
-        return out
+        head = self.out_lin(h).squeeze(-1)  # [N]
 
+        if self.is_softplus:
+            y_hat = self.softplus(head)
+        elif self.is_log1p:
+            y_hat = torch.expm1(head).clamp_min(0.0)
+        else:
+            y_hat = head
 
-# ============================================================
+        return y_hat
+    
+#  ============================================================
 # 3. Homogeneous 5-type GIN Regressor
 #    (treat all node types in one big graph, with type embedding)
 # ============================================================
 
 class HomogeneousFiveTypeGINRegressor(nn.Module):
     """
-    GIN đồng nhất, gộp 5 node-type vào một graph lớn.
-    Dùng embedding node-type để cho model phân biệt type.
-    Output chỉ trên các node 'product'.
-
-    num_nodes_dict: {node_type: N_type}
-    node_type_order: list theo thứ tự concat để build global node index.
+    GIN đồng nhất 5 node-type, output y_hat trên scale gốc cho node 'product'.
     """
 
     def __init__(
@@ -98,14 +112,18 @@ class HomogeneousFiveTypeGINRegressor(nn.Module):
         hidden_channels: int = 128,
         num_layers: int = 3,
         node_type_emb_dim: int = 8,
-        use_softplus_output: bool = False,
+        is_softplus: bool = False,
+        is_log1p: bool = False,
     ):
         super().__init__()
+        if is_softplus and is_log1p:
+            raise ValueError("Only one of is_softplus / is_log1p can be True.")
+
         self.num_nodes_dict = num_nodes_dict
         self.node_type_order = node_type_order
-        self.use_softplus_output = use_softplus_output
+        self.is_softplus = is_softplus
+        self.is_log1p = is_log1p
 
-        # Tính tổng số node và offset cho từng type
         offsets = {}
         offset = 0
         for nt in node_type_order:
@@ -118,7 +136,6 @@ class HomogeneousFiveTypeGINRegressor(nn.Module):
         )
         self.total_num_nodes = offset
 
-        # mapping: global_index -> node_type_id (0..num_types-1)
         node_type_id = torch.empty(self.total_num_nodes, dtype=torch.long)
         cur = 0
         for i, nt in enumerate(node_type_order):
@@ -130,61 +147,48 @@ class HomogeneousFiveTypeGINRegressor(nn.Module):
         self.num_types = len(node_type_order)
         self.type_emb = nn.Embedding(self.num_types, node_type_emb_dim)
 
-        # GIN layers
         self.convs = nn.ModuleList()
         self.convs.append(
             GINConv(MLP(in_channels + node_type_emb_dim, hidden_channels))
         )
         for _ in range(num_layers - 1):
-            self.convs.append(
-                GINConv(MLP(hidden_channels, hidden_channels))
-            )
+            self.convs.append(GINConv(MLP(hidden_channels, hidden_channels)))
 
         self.out_lin = nn.Linear(hidden_channels, 1)
+        if self.is_softplus:
+            self.softplus = nn.Softplus()
 
     def _concat_x_dict(self, x_dict: dict):
-        """
-        x_dict: {node_type: [N_type, F]}
-        Trả về:
-          x_all: [N_total, F]
-        """
         xs = []
         for nt in self.node_type_order:
             xs.append(x_dict[nt])
-        x_all = torch.cat(xs, dim=0)
-        return x_all
+        return torch.cat(xs, dim=0)
 
     def forward(self, x_dict: dict, edge_index):
-        """
-        x_dict: {node_type: [N_type, F]}
-        edge_index: [2, E] trên global node index
-        return: [N_product] (theo thứ tự product trong node_type_order)
-        """
         device = edge_index.device
-        # concat features
-        x_all = self._concat_x_dict(x_dict).to(device)  # [N_total, F]
-        node_type_id = self.node_type_id.to(device)     # [N_total]
-        type_emb = self.type_emb(node_type_id)          # [N_total, D_type]
+        x_all = self._concat_x_dict(x_dict).to(device)
+        node_type_id = self.node_type_id.to(device)
+        type_emb = self.type_emb(node_type_id)
 
-        h = torch.cat([x_all, type_emb], dim=-1)        # [N_total, F + D_type]
+        h = torch.cat([x_all, type_emb], dim=-1)
 
         for conv in self.convs:
             h = conv(h, edge_index)
             h = F.relu(h)
 
-        out_all = self.out_lin(h).squeeze(-1)           # [N_total]
-        if self.use_softplus_output:
-            out_all = F.softplus(out_all)
+        head_all = self.out_lin(h).squeeze(-1)  # [N_total]
 
-        # Lấy lại chỉ phần product
-        # product được assume có tên 'product' trong node_type_order
+        if self.is_softplus:
+            head_all = self.softplus(head_all)
+        elif self.is_log1p:
+            head_all = torch.expm1(head_all).clamp_min(0.0)
+
         idx_prod_type = self.node_type_order.index("product")
         offset_prod = self.node_type_offsets[idx_prod_type].item()
         n_prod = self.num_nodes_dict["product"]
-        out_prod = out_all[offset_prod:offset_prod + n_prod]   # [N_product]
+        out_prod = head_all[offset_prod:offset_prod + n_prod]
         return out_prod
-
-
+    
 # ============================================================
 # 4. Heterogeneous GIN Regressor (5-type)
 # ============================================================
@@ -214,10 +218,8 @@ class HeterogeneousGINLayer(nn.Module):
     
 class HeterogeneousGINRegressor(nn.Module):
     """
-    Heterogeneous GIN trên graph 5 node-type.
-    x_dict: {node_type: [N_type, F]}
-    edge_index_dict: {(src_type, rel, dst_type): [2, E]}
-    Output: chỉ trên node_type 'product'.
+    Heterogeneous GIN 5 node-type.
+    Output y_hat trên scale gốc cho node_type 'product'.
     """
 
     def __init__(
@@ -225,47 +227,59 @@ class HeterogeneousGINRegressor(nn.Module):
         in_channels_dict: dict,
         hidden_channels: int = 128,
         num_layers: int = 2,
-        use_softplus_output: bool = False,
+        is_softplus: bool = False,
+        is_log1p: bool = False,
     ):
         super().__init__()
+        if is_softplus and is_log1p:
+            raise ValueError("Only one of is_softplus / is_log1p can be True.")
+
         self.node_types = [nt for nt in in_channels_dict.keys() if nt != "edge_types"]
-        self.use_softplus_output = use_softplus_output
+        self.is_softplus = is_softplus
+        self.is_log1p = is_log1p
 
-        # Đảm bảo có key "edge_types" trong in_channels_dict nếu dùng HeterogeneousGINLayer
         if "edge_types" not in in_channels_dict:
-            raise ValueError("in_channels_dict must contain key 'edge_types' listing edge types.")
+            raise ValueError(
+                "in_channels_dict must contain key 'edge_types' listing edge types."
+            )
 
-        # Mạng cho từng node_type
         self.node_in_proj = nn.ModuleDict()
         for nt in self.node_types:
             self.node_in_proj[nt] = nn.Linear(in_channels_dict[nt], hidden_channels)
 
-        # Các layer Hetero GIN
         self.layers = nn.ModuleList()
-        in_chs = {"edge_types": in_channels_dict["edge_types"], **{nt: hidden_channels for nt in self.node_types}}
+        in_chs = {
+            "edge_types": in_channels_dict["edge_types"],
+            **{nt: hidden_channels for nt in self.node_types},
+        }
         for _ in range(num_layers):
             self.layers.append(HeterogeneousGINLayer(in_chs, hidden_channels))
 
         self.out_lin = nn.Linear(hidden_channels, 1)
+        if self.is_softplus:
+            self.softplus = nn.Softplus()
 
     def forward(self, x_dict, edge_index_dict):
-        # project input features
         h_dict = {}
         for nt in self.node_types:
             h_dict[nt] = F.relu(self.node_in_proj[nt](x_dict[nt]))
 
-        # Hetero layers
         for layer in self.layers:
             h_dict = layer(h_dict, edge_index_dict)
             for nt in h_dict.keys():
                 h_dict[nt] = F.relu(h_dict[nt])
 
-        out_prod = self.out_lin(h_dict["product"]).squeeze(-1)
-        if self.use_softplus_output:
-            out_prod = F.softplus(out_prod)
-        return out_prod
+        head = self.out_lin(h_dict["product"]).squeeze(-1)
 
+        if self.is_softplus:
+            y_hat = self.softplus(head)
+        elif self.is_log1p:
+            y_hat = torch.expm1(head).clamp_min(0.0)
+        else:
+            y_hat = head
 
+        return y_hat
+    
 # ============================================================
 # Helper: chuyển h_dict sang định dạng cần cho HeterogeneousGINLayer (nếu muốn tách)
 # ============================================================

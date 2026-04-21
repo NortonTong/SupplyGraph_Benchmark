@@ -1,5 +1,3 @@
 temporal_type,lag_window,horizon,model_family,graph_type,variant,tag,edge_view,target_transform,clip_pred,use_softplus_output,MAE_test,RMSE_test,MAPE_test,sMAPE_test
 unit,7,7,naive_last_t0,no_graph,naive_last_t0,naive_last_t0_h7_lag7_unit,,raw,False,False,404.7803092041698,1117.0676323476123,125.05763671340911,62.20101400471866
 unit,14,7,naive_last_t0,no_graph,naive_last_t0,naive_last_t0_h7_lag14_unit,,raw,False,False,404.7803092041698,1117.0676323476123,125.05763671340911,62.20101400471866
-weight,7,7,naive_last_t0,no_graph,naive_last_t0,naive_last_t0_h7_lag7_weight,,raw,False,False,6.47077125131579,18.540213766340464,125.05763671340912,62.20100990076695
-weight,14,7,naive_last_t0,no_graph,naive_last_t0,naive_last_t0_h7_lag14_weight,,raw,False,False,6.47077125131579,18.540213766340464,125.05763671340912,62.20100990076695

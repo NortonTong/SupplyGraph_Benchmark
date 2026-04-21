@@ -30,12 +30,16 @@ def smape(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-8) -> float:
 
 
 def load_baseline_dataset(horizon: int, lag_window: int, temporal_type: str = "unit") -> pd.DataFrame:
-    path = PROC_DIR / "baseline" / f"xgboost_h{horizon}_lag{lag_window}_{temporal_type}_full.csv"
+    """
+    Load FULL baseline dataset đã build cho XGBoost:
+    data/processed/baseline/xgboost/xgboost_h{horizon}_lag{lag_window}_{temporal_type}_full.csv
+    """
+    path = PROC_DIR / "baseline" / "xgboost" / f"xgboost_h{horizon}_lag{lag_window}_{temporal_type}_full.csv"
+    print(f"[LOAD] Naive baseline source: {path}")
     df = pd.read_csv(path)
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values(["node_id", "day"]).reset_index(drop=True)
     return df
-
 
 def save_and_eval_naive_last_t0(
     df_test: pd.DataFrame,
@@ -134,7 +138,7 @@ def run_naive_last_t0():
 
     horizons = [7]
     lag_windows = [7, 14]
-    temporal_types = ["unit", "weight"]
+    temporal_types = ["unit"]
 
     for h in horizons:
         for lag_w in lag_windows:
