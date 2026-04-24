@@ -29,49 +29,70 @@ def build_product_index_mapping(df_base: pd.DataFrame):
     idx2pos = {int(idx): i for i, idx in enumerate(node_indices)}
     return node_indices, idx2pos
 
-
-def build_Y_from_base(df_base: pd.DataFrame, node_indices) -> tuple[np.ndarray, np.ndarray]:
+def build_Ys_from_base(
+    df_base: pd.DataFrame,
+    node_indices,
+    value_cols: list[str],
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
     """
-    Y[t, i] = signal dùng cho neighbor aggregation tại day t, product i (theo node_index).
+    Trả về:
+      - Ys: dict[value_name] -> Y_value (T x N)
+      - days: vector ngày (T,)
 
-    Ưu tiên:
-    - Nếu có cột 'sales_order' thì dùng.
-    - Nếu không có, dùng 'target' (file baseline XGB đã rename label thành target).
+    Với mỗi value_name trong value_cols (vd 'sales', 'production', ...),
+    Y_value[t, i] = giá trị tại day t, product i (theo node_index).
     """
     df = df_base.sort_values(["day", "node_index"]).copy()
     days = np.sort(df["day"].unique())
     T = len(days)
     N = len(node_indices)
-    Y = np.full((T, N), np.nan, dtype=float)
-
-    # chọn cột làm tín hiệu
-    if "sales_order" in df.columns:
-        value_col = "sales_order"
-    elif "y" in df.columns:
-        value_col = "y"
-    elif "y_h7" in df.columns:
-        value_col = "y_h7"
-    elif "target" in df.columns:
-        value_col = "target"
-    else:
-        raise KeyError(
-            "Không tìm thấy cột giá trị để build Y (sales_order / y / y_h7 / target) "
-            f"trong df_base: {df.columns.tolist()}"
-        )
 
     day2idx = {int(d): k for k, d in enumerate(days)}
     idx2pos = {int(n): i for i, n in enumerate(node_indices)}
 
+    # chuẩn bị ma trận
+    Ys: dict[str, np.ndarray] = {}
+    for v in value_cols:
+        Ys[v] = np.full((T, N), np.nan, dtype=float)
+
+    # xác định cột thật trong df
+    # sales_order / target
+    if "sales_order" in df.columns:
+        col_sales = "sales_order"
+    elif "target" in df.columns:
+        col_sales = "target"
+    else:
+        col_sales = None
+
     for _, r in df.iterrows():
         t = day2idx[int(r["day"])]
         pos = idx2pos[int(r["node_index"])]
-        val = r[value_col]
-        if pd.isna(val):
-            continue
-        Y[t, pos] = float(val)
 
-    return Y, days
+        # sales (sales_order / target)
+        if "sales" in value_cols and col_sales is not None:
+            val = r[col_sales]
+            if not pd.isna(val):
+                Ys["sales"][t, pos] = float(val)
 
+        # production
+        if "production" in value_cols and "production" in df.columns:
+            val = r["production"]
+            if not pd.isna(val):
+                Ys["production"][t, pos] = float(val)
+
+        # delivery
+        if "delivery" in value_cols and "delivery" in df.columns:
+            val = r["delivery"]
+            if not pd.isna(val):
+                Ys["delivery"][t, pos] = float(val)
+
+        # factory_issue
+        if "factory_issue" in value_cols and "factory_issue" in df.columns:
+            val = r["factory_issue"]
+            if not pd.isna(val):
+                Ys["factory_issue"][t, pos] = float(val)
+
+    return Ys, days
 # =========================
 # Neighbor indices: projected
 # =========================
@@ -85,7 +106,6 @@ def build_neighbor_indices_projected(df_meta: pd.DataFrame, idx2pos: dict):
         k: [[] for _ in range(len(idx2pos))]
         for k in ["same_group", "same_subgroup", "same_plant", "same_storage"]
     }
-
     df_prod = df_meta[
         ["node_index", "group", "sub_group", "plant", "storage_location"]
     ].copy()
@@ -325,7 +345,10 @@ def build_xgb_with_proj_features(df_base: pd.DataFrame,
                                  horizon: int,
                                  lag_window: int) -> pd.DataFrame:
     node_indices, idx2pos = build_product_index_mapping(df_base)
-    Y, days = build_Y_from_base(df_base, node_indices)
+
+    # build Ys cho 4 biến
+    value_cols = ["sales", "production", "delivery", "factory_issue"]
+    Ys, days = build_Ys_from_base(df_base, node_indices, value_cols)
 
     df_meta = load_node_metadata()
     neighbors_proj = build_neighbor_indices_projected(df_meta, idx2pos)
@@ -336,21 +359,24 @@ def build_xgb_with_proj_features(df_base: pd.DataFrame,
 
     for view in ["same_group", "same_subgroup", "same_plant", "same_storage"]:
         neigh = neighbors_proj[view]
-        for L in lags:
-            feats[f"adv_proj_{view}_mean_lag{L}"] = neighbor_mean_lag(Y, neigh, L)
-            feats[f"adv_proj_{view}_sum_lag{L}"]  = neighbor_sum_lag(Y, neigh, L)
-            feats[f"adv_proj_{view}_max_lag{L}"]  = neighbor_max_lag(Y, neigh, L)
-            feats[f"adv_proj_{view}_min_lag{L}"]  = neighbor_min_lag(Y, neigh, L)
-        feats[f"adv_proj_{view}_zero_ratio_win{win_zero}"] = neighbor_zero_ratio_window(Y, neigh, win_zero)
+        for vname, Yv in Ys.items():
+            # sales / production / delivery / factory_issue
+            for L in lags:
+                feats[f"adv_{vname}_proj_{view}_mean_lag{L}"] = neighbor_mean_lag(Yv, neigh, L)
+                feats[f"adv_{vname}_proj_{view}_sum_lag{L}"]  = neighbor_sum_lag(Yv, neigh, L)
+                feats[f"adv_{vname}_proj_{view}_max_lag{L}"]  = neighbor_max_lag(Yv, neigh, L)
+                feats[f"adv_{vname}_proj_{view}_min_lag{L}"]  = neighbor_min_lag(Yv, neigh, L)
+            feats[f"adv_{vname}_proj_{view}_zero_ratio_win{win_zero}"] = neighbor_zero_ratio_window(
+                Yv, neigh, win_zero
+            )
 
+    # flatten & merge
     records = []
-    T, N = Y.shape
+    T = len(days)
+    N = len(node_indices)
     for t_idx, day in enumerate(days):
         for i, node_idx in enumerate(node_indices):
-            rec = {
-                "day": int(day),
-                "node_index": int(node_idx),
-            }
+            rec = {"day": int(day), "node_index": int(node_idx)}
             for name, arr in feats.items():
                 rec[name] = arr[t_idx, i]
             records.append(rec)
@@ -359,13 +385,13 @@ def build_xgb_with_proj_features(df_base: pd.DataFrame,
     df_merged = df_base.merge(df_feat, on=["day", "node_index"], how="left")
     return df_merged
 
-
 def build_xgb_with_homo_features(df_base: pd.DataFrame,
                                  temporal_type: str,
                                  horizon: int,
                                  lag_window: int) -> pd.DataFrame:
     node_indices, idx2pos = build_product_index_mapping(df_base)
-    Y, days = build_Y_from_base(df_base, node_indices)
+    value_cols = ["sales", "production", "delivery", "factory_issue"]
+    Ys, days = build_Ys_from_base(df_base, node_indices, value_cols)
 
     edge_index_homo5, num_nodes_homo5, nodes_homo_tbl = build_homo5type_from_parquet()
     neighbors_homo = build_neighbor_indices_homo5(edge_index_homo5, nodes_homo_tbl, idx2pos)
@@ -375,21 +401,22 @@ def build_xgb_with_homo_features(df_base: pd.DataFrame,
     win_zero = lag_window
 
     for view, neigh in neighbors_homo.items():
-        for L in lags:
-            feats[f"adv_{view}_mean_lag{L}"] = neighbor_mean_lag(Y, neigh, L)
-            feats[f"adv_{view}_sum_lag{L}"]  = neighbor_sum_lag(Y, neigh, L)
-            feats[f"adv_{view}_max_lag{L}"]  = neighbor_max_lag(Y, neigh, L)
-            feats[f"adv_{view}_min_lag{L}"]  = neighbor_min_lag(Y, neigh, L)
-        feats[f"adv_{view}_zero_ratio_win{win_zero}"] = neighbor_zero_ratio_window(Y, neigh, win_zero)
+        for vname, Yv in Ys.items():
+            for L in lags:
+                feats[f"adv_{vname}_{view}_mean_lag{L}"] = neighbor_mean_lag(Yv, neigh, L)
+                feats[f"adv_{vname}_{view}_sum_lag{L}"]  = neighbor_sum_lag(Yv, neigh, L)
+                feats[f"adv_{vname}_{view}_max_lag{L}"]  = neighbor_max_lag(Yv, neigh, L)
+                feats[f"adv_{vname}_{view}_min_lag{L}"]  = neighbor_min_lag(Yv, neigh, L)
+            feats[f"adv_{vname}_{view}_zero_ratio_win{win_zero}"] = neighbor_zero_ratio_window(
+                Yv, neigh, win_zero
+            )
 
     records = []
-    T, N = Y.shape
+    T = len(days)
+    N = len(node_indices)
     for t_idx, day in enumerate(days):
         for i, node_idx in enumerate(node_indices):
-            rec = {
-                "day": int(day),
-                "node_index": int(node_idx),
-            }
+            rec = {"day": int(day), "node_index": int(node_idx)}
             for name, arr in feats.items():
                 rec[name] = arr[t_idx, i]
             records.append(rec)
@@ -398,13 +425,13 @@ def build_xgb_with_homo_features(df_base: pd.DataFrame,
     df_merged = df_base.merge(df_feat, on=["day", "node_index"], how="left")
     return df_merged
 
-
 def build_xgb_with_hetero_features(df_base: pd.DataFrame,
                                    temporal_type: str,
                                    horizon: int,
                                    lag_window: int) -> pd.DataFrame:
     node_indices, idx2pos = build_product_index_mapping(df_base)
-    Y, days = build_Y_from_base(df_base, node_indices)
+    value_cols = ["sales", "production", "delivery", "factory_issue"]
+    Ys, days = build_Ys_from_base(df_base, node_indices, value_cols)
 
     edge_index_het5, num_nodes_het5, nodes_het_tbl = build_hetero5type_from_parquet()
     neighbors_het = build_neighbor_indices_hetero5(edge_index_het5, nodes_het_tbl, idx2pos)
@@ -414,21 +441,22 @@ def build_xgb_with_hetero_features(df_base: pd.DataFrame,
     win_zero = lag_window
 
     for view, neigh in neighbors_het.items():
-        for L in lags:
-            feats[f"adv_{view}_mean_lag{L}"] = neighbor_mean_lag(Y, neigh, L)
-            feats[f"adv_{view}_sum_lag{L}"]  = neighbor_sum_lag(Y, neigh, L)
-            feats[f"adv_{view}_max_lag{L}"]  = neighbor_max_lag(Y, neigh, L)
-            feats[f"adv_{view}_min_lag{L}"]  = neighbor_min_lag(Y, neigh, L)
-        feats[f"adv_{view}_zero_ratio_win{win_zero}"] = neighbor_zero_ratio_window(Y, neigh, win_zero)
+        for vname, Yv in Ys.items():
+            for L in lags:
+                feats[f"adv_{vname}_{view}_mean_lag{L}"] = neighbor_mean_lag(Yv, neigh, L)
+                feats[f"adv_{vname}_{view}_sum_lag{L}"]  = neighbor_sum_lag(Yv, neigh, L)
+                feats[f"adv_{vname}_{view}_max_lag{L}"]  = neighbor_max_lag(Yv, neigh, L)
+                feats[f"adv_{vname}_{view}_min_lag{L}"]  = neighbor_min_lag(Yv, neigh, L)
+            feats[f"adv_{vname}_{view}_zero_ratio_win{win_zero}"] = neighbor_zero_ratio_window(
+                Yv, neigh, win_zero
+            )
 
     records = []
-    T, N = Y.shape
+    T = len(days)
+    N = len(node_indices)
     for t_idx, day in enumerate(days):
         for i, node_idx in enumerate(node_indices):
-            rec = {
-                "day": int(day),
-                "node_index": int(node_idx),
-            }
+            rec = {"day": int(day), "node_index": int(node_idx)}
             for name, arr in feats.items():
                 rec[name] = arr[t_idx, i]
             records.append(rec)
@@ -436,7 +464,6 @@ def build_xgb_with_hetero_features(df_base: pd.DataFrame,
 
     df_merged = df_base.merge(df_feat, on=["day", "node_index"], how="left")
     return df_merged
-
 
 # =========================
 # main: dùng DEFAULT_EXPERIMENTS + baseline graph
