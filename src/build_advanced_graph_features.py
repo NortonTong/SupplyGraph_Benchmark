@@ -5,8 +5,6 @@ import pandas as pd
 
 from config.config import PROC_DIR, DEFAULT_EXPERIMENTS
 from data_preprocessing_baselines import (
-    CAT_COLS,
-    one_hot_encode_splits,
     load_node_metadata,
 )
 from build_graphs import (
@@ -34,7 +32,11 @@ def build_product_index_mapping(df_base: pd.DataFrame):
 
 def build_Y_from_base(df_base: pd.DataFrame, node_indices) -> tuple[np.ndarray, np.ndarray]:
     """
-    Y[t, i] = sales_order tại day t, product i (theo node_index).
+    Y[t, i] = signal dùng cho neighbor aggregation tại day t, product i (theo node_index).
+
+    Ưu tiên:
+    - Nếu có cột 'sales_order' thì dùng.
+    - Nếu không có, dùng 'target' (file baseline XGB đã rename label thành target).
     """
     df = df_base.sort_values(["day", "node_index"]).copy()
     days = np.sort(df["day"].unique())
@@ -42,15 +44,33 @@ def build_Y_from_base(df_base: pd.DataFrame, node_indices) -> tuple[np.ndarray, 
     N = len(node_indices)
     Y = np.full((T, N), np.nan, dtype=float)
 
+    # chọn cột làm tín hiệu
+    if "sales_order" in df.columns:
+        value_col = "sales_order"
+    elif "y" in df.columns:
+        value_col = "y"
+    elif "y_h7" in df.columns:
+        value_col = "y_h7"
+    elif "target" in df.columns:
+        value_col = "target"
+    else:
+        raise KeyError(
+            "Không tìm thấy cột giá trị để build Y (sales_order / y / y_h7 / target) "
+            f"trong df_base: {df.columns.tolist()}"
+        )
+
     day2idx = {int(d): k for k, d in enumerate(days)}
     idx2pos = {int(n): i for i, n in enumerate(node_indices)}
 
     for _, r in df.iterrows():
         t = day2idx[int(r["day"])]
         pos = idx2pos[int(r["node_index"])]
-        Y[t, pos] = float(r["sales_order"])
-    return Y, days
+        val = r[value_col]
+        if pd.isna(val):
+            continue
+        Y[t, pos] = float(val)
 
+    return Y, days
 
 # =========================
 # Neighbor indices: projected
@@ -102,14 +122,6 @@ def build_neighbor_indices_homo5(edge_index_homo5, nodes_homo_tbl: pd.DataFrame,
     for nt in nodes["node_type"].unique():
         df_nt = nodes[nodes["node_type"] == nt].copy().reset_index(drop=True)
         type_groups[nt] = df_nt
-
-    nodeid2type = {}
-    nodeid2local = {}
-    for nt, df_nt in type_groups.items():
-        for i, row in df_nt.iterrows():
-            nid = str(row["node_id"])
-            nodeid2type[nid] = nt
-            nodeid2local[nid] = int(i)
 
     df_prod = type_groups.get("product", pd.DataFrame()).copy()
     prod_nodeindex2local = {}
@@ -176,14 +188,6 @@ def build_neighbor_indices_hetero5(edge_index_het5, nodes_het_tbl: pd.DataFrame,
     for nt in nodes["node_type"].unique():
         df_nt = nodes[nodes["node_type"] == nt].copy().reset_index(drop=True)
         type_groups[nt] = df_nt
-
-    nodeid2type = {}
-    nodeid2local = {}
-    for nt, df_nt in type_groups.items():
-        for i, row in df_nt.iterrows():
-            nid = str(row["node_id"])
-            nodeid2type[nid] = nt
-            nodeid2local[nid] = int(i)
 
     df_prod = type_groups.get("product", pd.DataFrame()).copy()
     prod_nodeindex2local = {}
@@ -313,7 +317,7 @@ def neighbor_zero_ratio_window(Y, neighbor_idx, window: int):
 
 
 # =========================
-# 3 builders: proj / homo / hetero
+# 3 builders: thêm advanced feature vào df_base đã OHE
 # =========================
 
 def build_xgb_with_proj_features(df_base: pd.DataFrame,
@@ -333,13 +337,12 @@ def build_xgb_with_proj_features(df_base: pd.DataFrame,
     for view in ["same_group", "same_subgroup", "same_plant", "same_storage"]:
         neigh = neighbors_proj[view]
         for L in lags:
-            feats[f"proj_{view}_mean_lag{L}"] = neighbor_mean_lag(Y, neigh, L)
-            feats[f"proj_{view}_sum_lag{L}"]  = neighbor_sum_lag(Y, neigh, L)
-            feats[f"proj_{view}_max_lag{L}"]  = neighbor_max_lag(Y, neigh, L)
-            feats[f"proj_{view}_min_lag{L}"]  = neighbor_min_lag(Y, neigh, L)
-        feats[f"proj_{view}_zero_ratio_win{win_zero}"] = neighbor_zero_ratio_window(Y, neigh, win_zero)
+            feats[f"adv_proj_{view}_mean_lag{L}"] = neighbor_mean_lag(Y, neigh, L)
+            feats[f"adv_proj_{view}_sum_lag{L}"]  = neighbor_sum_lag(Y, neigh, L)
+            feats[f"adv_proj_{view}_max_lag{L}"]  = neighbor_max_lag(Y, neigh, L)
+            feats[f"adv_proj_{view}_min_lag{L}"]  = neighbor_min_lag(Y, neigh, L)
+        feats[f"adv_proj_{view}_zero_ratio_win{win_zero}"] = neighbor_zero_ratio_window(Y, neigh, win_zero)
 
-    # flatten & merge
     records = []
     T, N = Y.shape
     for t_idx, day in enumerate(days):
@@ -352,37 +355,9 @@ def build_xgb_with_proj_features(df_base: pd.DataFrame,
                 rec[name] = arr[t_idx, i]
             records.append(rec)
     df_feat = pd.DataFrame(records)
+
     df_merged = df_base.merge(df_feat, on=["day", "node_index"], how="left")
-
-    label_col = f"y_h{horizon}"
-    base_cols = ["node_id", "node_index", "date", "day", "split"]
-
-    tabular_cols = [
-        c
-        for c in df_merged.columns
-        if any(
-            kw in c
-            for kw in [
-                "lag",
-                f"roll{lag_window}_",
-                "group", "sub_group",
-                "plant", "storage_location",
-                "day_of_week", "is_weekend", "month", "day_of_month",
-            ]
-        )
-    ]
-    graph_cols = [c for c in df_merged.columns if c.startswith("proj_")]
-    feature_cols = sorted(set(tabular_cols + graph_cols))
-
-    df_h = df_merged[base_cols + feature_cols + [label_col]].rename(columns={label_col: "target"})
-    df_ohe = one_hot_encode_splits(df_h, CAT_COLS)
-
-    out_dir = PROC_DIR / "baseline" / "xgboost"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"xgboost_tabular_graphfeat_projected_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
-    df_ohe.to_parquet(out_path, index=False)
-    print(f"Saved XGBoost + projected graph neighbor features to {out_path}")
-    return df_ohe
+    return df_merged
 
 
 def build_xgb_with_homo_features(df_base: pd.DataFrame,
@@ -401,11 +376,11 @@ def build_xgb_with_homo_features(df_base: pd.DataFrame,
 
     for view, neigh in neighbors_homo.items():
         for L in lags:
-            feats[f"{view}_mean_lag{L}"] = neighbor_mean_lag(Y, neigh, L)
-            feats[f"{view}_sum_lag{L}"]  = neighbor_sum_lag(Y, neigh, L)
-            feats[f"{view}_max_lag{L}"]  = neighbor_max_lag(Y, neigh, L)
-            feats[f"{view}_min_lag{L}"]  = neighbor_min_lag(Y, neigh, L)
-        feats[f"{view}_zero_ratio_win{win_zero}"] = neighbor_zero_ratio_window(Y, neigh, win_zero)
+            feats[f"adv_{view}_mean_lag{L}"] = neighbor_mean_lag(Y, neigh, L)
+            feats[f"adv_{view}_sum_lag{L}"]  = neighbor_sum_lag(Y, neigh, L)
+            feats[f"adv_{view}_max_lag{L}"]  = neighbor_max_lag(Y, neigh, L)
+            feats[f"adv_{view}_min_lag{L}"]  = neighbor_min_lag(Y, neigh, L)
+        feats[f"adv_{view}_zero_ratio_win{win_zero}"] = neighbor_zero_ratio_window(Y, neigh, win_zero)
 
     records = []
     T, N = Y.shape
@@ -419,37 +394,9 @@ def build_xgb_with_homo_features(df_base: pd.DataFrame,
                 rec[name] = arr[t_idx, i]
             records.append(rec)
     df_feat = pd.DataFrame(records)
+
     df_merged = df_base.merge(df_feat, on=["day", "node_index"], how="left")
-
-    label_col = f"y_h{horizon}"
-    base_cols = ["node_id", "node_index", "date", "day", "split"]
-
-    tabular_cols = [
-        c
-        for c in df_merged.columns
-        if any(
-            kw in c
-            for kw in [
-                "lag",
-                f"roll{lag_window}_",
-                "group", "sub_group",
-                "plant", "storage_location",
-                "day_of_week", "is_weekend", "month", "day_of_month",
-            ]
-        )
-    ]
-    graph_cols = [c for c in df_merged.columns if c.startswith("homo_")]
-    feature_cols = sorted(set(tabular_cols + graph_cols))
-
-    df_h = df_merged[base_cols + feature_cols + [label_col]].rename(columns={label_col: "target"})
-    df_ohe = one_hot_encode_splits(df_h, CAT_COLS)
-
-    out_dir = PROC_DIR / "baseline" / "xgboost"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"xgboost_tabular_graphfeat_homo5_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
-    df_ohe.to_parquet(out_path, index=False)
-    print(f"Saved XGBoost + homo5 graph neighbor features to {out_path}")
-    return df_ohe
+    return df_merged
 
 
 def build_xgb_with_hetero_features(df_base: pd.DataFrame,
@@ -468,11 +415,11 @@ def build_xgb_with_hetero_features(df_base: pd.DataFrame,
 
     for view, neigh in neighbors_het.items():
         for L in lags:
-            feats[f"{view}_mean_lag{L}"] = neighbor_mean_lag(Y, neigh, L)
-            feats[f"{view}_sum_lag{L}"]  = neighbor_sum_lag(Y, neigh, L)
-            feats[f"{view}_max_lag{L}"]  = neighbor_max_lag(Y, neigh, L)
-            feats[f"{view}_min_lag{L}"]  = neighbor_min_lag(Y, neigh, L)
-        feats[f"{view}_zero_ratio_win{win_zero}"] = neighbor_zero_ratio_window(Y, neigh, win_zero)
+            feats[f"adv_{view}_mean_lag{L}"] = neighbor_mean_lag(Y, neigh, L)
+            feats[f"adv_{view}_sum_lag{L}"]  = neighbor_sum_lag(Y, neigh, L)
+            feats[f"adv_{view}_max_lag{L}"]  = neighbor_max_lag(Y, neigh, L)
+            feats[f"adv_{view}_min_lag{L}"]  = neighbor_min_lag(Y, neigh, L)
+        feats[f"adv_{view}_zero_ratio_win{win_zero}"] = neighbor_zero_ratio_window(Y, neigh, win_zero)
 
     records = []
     T, N = Y.shape
@@ -486,59 +433,76 @@ def build_xgb_with_hetero_features(df_base: pd.DataFrame,
                 rec[name] = arr[t_idx, i]
             records.append(rec)
     df_feat = pd.DataFrame(records)
+
     df_merged = df_base.merge(df_feat, on=["day", "node_index"], how="left")
-
-    label_col = f"y_h{horizon}"
-    base_cols = ["node_id", "node_index", "date", "day", "split"]
-
-    tabular_cols = [
-        c
-        for c in df_merged.columns
-        if any(
-            kw in c
-            for kw in [
-                "lag",
-                f"roll{lag_window}_",
-                "group", "sub_group",
-                "plant", "storage_location",
-                "day_of_week", "is_weekend", "month", "day_of_month",
-            ]
-        )
-    ]
-    graph_cols = [c for c in df_merged.columns if c.startswith("het_")]
-    feature_cols = sorted(set(tabular_cols + graph_cols))
-
-    df_h = df_merged[base_cols + feature_cols + [label_col]].rename(columns={label_col: "target"})
-    df_ohe = one_hot_encode_splits(df_h, CAT_COLS)
-
-    out_dir = PROC_DIR / "baseline" / "xgboost"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"xgboost_tabular_graphfeat_hetero5_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
-    df_ohe.to_parquet(out_path, index=False)
-    print(f"Saved XGBoost + hetero5 graph neighbor features to {out_path}")
-    return df_ohe
+    return df_merged
 
 
 # =========================
-# main
+# main: dùng DEFAULT_EXPERIMENTS + baseline graph
 # =========================
 
 def main():
-    base_dir = PROC_DIR / "base"
+    base_graph_dir = PROC_DIR / "baseline" / "xgb_graph"
+    out_dir = PROC_DIR / "baseline" / "xgboost"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     for exp in DEFAULT_EXPERIMENTS:
         t_type = exp.temporal_type
         for H in exp.horizons:
             for L in exp.lag_windows:
-                full_path = base_dir / f"base_full_h{H}_lag{L}_{t_type}.parquet"
-                if not full_path.exists():
-                    print(f"[ADV-GRAPH] base_full not found: {full_path}, skip.")
-                    continue
-                df_base = pd.read_parquet(full_path)
                 print(f"\n=== Advanced graph features: temporal_type={t_type}, H={H}, L={L} ===")
 
-                build_xgb_with_proj_features(df_base, t_type, H, L)
-                build_xgb_with_homo_features(df_base, t_type, H, L)
-                build_xgb_with_hetero_features(df_base, t_type, H, L)
+                # 1) projected
+                path_proj = base_graph_dir / f"xgboost_tabular_graph_projected_h{H}_lag{L}_{t_type}.parquet"
+                if path_proj.exists():
+                    df_proj = pd.read_parquet(path_proj)
+                    print(f"[ADV-GRAPH] Load projected baseline from {path_proj}, shape={df_proj.shape}")
+                    df_proj_adv = build_xgb_with_proj_features(
+                        df_base=df_proj,
+                        temporal_type=t_type,
+                        horizon=H,
+                        lag_window=L,
+                    )
+                    out_proj = out_dir / f"xgboost_tabular_graphfeat_projected_h{H}_lag{L}_{t_type}.parquet"
+                    df_proj_adv.to_parquet(out_proj, index=False)
+                    print(f"Saved projected + advanced features to {out_proj}")
+                else:
+                    print(f"[ADV-GRAPH] projected baseline not found: {path_proj}")
+
+                # 2) homo5
+                path_homo = base_graph_dir / f"xgboost_tabular_graph_homo5_h{H}_lag{L}_{t_type}.parquet"
+                if path_homo.exists():
+                    df_homo = pd.read_parquet(path_homo)
+                    print(f"[ADV-GRAPH] Load homo5 baseline from {path_homo}, shape={df_homo.shape}")
+                    df_homo_adv = build_xgb_with_homo_features(
+                        df_base=df_homo,
+                        temporal_type=t_type,
+                        horizon=H,
+                        lag_window=L,
+                    )
+                    out_homo = out_dir / f"xgboost_tabular_graphfeat_homo5_h{H}_lag{L}_{t_type}.parquet"
+                    df_homo_adv.to_parquet(out_homo, index=False)
+                    print(f"Saved homo5 + advanced features to {out_homo}")
+                else:
+                    print(f"[ADV-GRAPH] homo5 baseline not found: {path_homo}")
+
+                # 3) hetero5
+                path_het = base_graph_dir / f"xgboost_tabular_graph_hetero5_h{H}_lag{L}_{t_type}.parquet"
+                if path_het.exists():
+                    df_het = pd.read_parquet(path_het)
+                    print(f"[ADV-GRAPH] Load hetero5 baseline from {path_het}, shape={df_het.shape}")
+                    df_het_adv = build_xgb_with_hetero_features(
+                        df_base=df_het,
+                        temporal_type=t_type,
+                        horizon=H,
+                        lag_window=L,
+                    )
+                    out_het = out_dir / f"xgboost_tabular_graphfeat_hetero5_h{H}_lag{L}_{t_type}.parquet"
+                    df_het_adv.to_parquet(out_het, index=False)
+                    print(f"Saved hetero5 + advanced features to {out_het}")
+                else:
+                    print(f"[ADV-GRAPH] hetero5 baseline not found: {path_het}")
 
 
 if __name__ == "__main__":
