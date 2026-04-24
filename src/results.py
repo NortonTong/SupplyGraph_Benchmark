@@ -35,6 +35,7 @@ def load_baseline1_xgb() -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.read_csv(path)
+
     df["model_family"] = "xgb_tabular"
     df["graph_type"] = "no_graph"
     df["edge_view"] = None
@@ -47,6 +48,27 @@ def load_baseline1_xgb() -> pd.DataFrame:
 
     if "variant" not in df.columns:
         df["variant"] = "baseline_1_xgb_tabular"
+
+    if "lag_window" not in df.columns:
+        if "window" in df.columns:
+            df = df.rename(columns={"window": "lag_window"})
+        elif "L" in df.columns:
+            df = df.rename(columns={"L": "lag_window"})
+
+    if "use_early_stopping" not in df.columns:
+        df["use_early_stopping"] = True
+
+    def _ensure_tag_suffix(row):
+        tag = str(row.get("tag", ""))
+        if tag.endswith("_ES") or tag.endswith("_noES"):
+            return tag
+        if row.get("use_early_stopping", True):
+            return f"{tag}_ES"
+        else:
+            return f"{tag}_noES"
+
+    if "tag" in df.columns:
+        df["tag"] = df.apply(_ensure_tag_suffix, axis=1)
 
     return df
 
@@ -170,12 +192,6 @@ def load_baseline3_xgb_graph() -> pd.DataFrame:
 
 
 def load_gnn_summary() -> pd.DataFrame:
-    """
-    Load tất cả summary baseline_4 GNN:
-        PROC_DIR/predictions/baseline_4/*/summary_baseline_4_*.csv
-    Mỗi subfolder tương ứng 1 (temporal_type, mode) như:
-        baseline_4/unit_raw/summary_baseline_4_unit_raw.csv
-    """
     base_dir = PROC_DIR / "predictions" / "baseline_4"
     pattern = str(base_dir / "*" / "summary_baseline_4_*.csv")
     files = glob.glob(pattern)
@@ -235,11 +251,8 @@ def load_gnn_summary() -> pd.DataFrame:
     print(f"[GNN] Loaded {len(df_all)} GNN summary rows from {len(files)} files")
     return df_all
 
+
 def load_baseline5_xgb_gnn_embed() -> pd.DataFrame:
-    """
-    Load summary baseline 5: XGB + GNN embeddings.
-    File: PROC_DIR/predictions/baseline_5/summary_xgb_gnn_embed_baseline5_raw_lags_graphmodes.csv
-    """
     path = (
         PROC_DIR
         / "predictions"
@@ -252,7 +265,6 @@ def load_baseline5_xgb_gnn_embed() -> pd.DataFrame:
 
     df = pd.read_csv(path)
 
-    # Chuẩn hóa metadata
     df["model_family"] = "xgb_gnn_embed"
 
     if "graph_type" not in df.columns:
@@ -274,6 +286,63 @@ def load_baseline5_xgb_gnn_embed() -> pd.DataFrame:
         df["variant"] = "baseline_5_xgb_gnn_embed"
 
     return df
+
+
+def load_baseline6_residual_xgb_gnn() -> pd.DataFrame:
+    """
+    Load summary baseline 6: residual XGB + GNN.
+    File: PROC_DIR/predictions/baseline_6/summary_baseline_6_residual_xgb_gnn.csv
+    """
+    path = (
+        PROC_DIR
+        / "predictions"
+        / "baseline_6"
+        / "summary_baseline_6_residual_xgb_gnn.csv"
+    )
+    if not path.exists():
+        print(f"[BL6] Not found: {path}")
+        return pd.DataFrame()
+
+    df = pd.read_csv(path)
+
+    # đảm bảo các cột meta có đầy đủ / đúng tên
+    if "model_family" not in df.columns:
+        df["model_family"] = "xgb_gnn_residual"
+
+    if "graph_type" not in df.columns:
+        # nếu script baseline 6 đã có graph_type thì giữ nguyên, nếu không thì suy ra từ graph_type ở file
+        # ở script baseline 6 mình đã cho cột graph_type = projected / homo5 / hetero5
+        # nên đây chủ yếu là fallback
+        def _graph_type_from_graph_type_or_variant(row):
+            gt = row.get("graph_type")
+            if isinstance(gt, str):
+                return gt
+            v = row.get("variant")
+            if isinstance(v, str):
+                vl = v.lower()
+                if "projected" in vl:
+                    return "projected"
+                if "homo5" in vl:
+                    return "homo5"
+                if "hetero5" in vl:
+                    return "hetero5"
+            return "gnn_residual"
+        df["graph_type"] = df.apply(_graph_type_from_graph_type_or_variant, axis=1)
+
+    if "edge_view" not in df.columns:
+        df["edge_view"] = None  # projected có edge_view riêng, homo/hetero là None
+
+    if "target_transform" not in df.columns and "mode" in df.columns:
+        # trong script baseline 6 mình dùng field 'mode' = raw/log1p
+        df["target_transform"] = df["mode"]
+    elif "target_transform" not in df.columns:
+        df["target_transform"] = "raw"
+
+    if "variant" not in df.columns:
+        df["variant"] = "baseline_6_residual_xgb_gnn"
+
+    return df
+
 
 def harmonize_columns(df: pd.DataFrame) -> pd.DataFrame:
     required_cols = [
@@ -307,6 +376,67 @@ def harmonize_columns(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.NA
     return df[required_cols]
 
+def load_baseline7_baseline_7() -> pd.DataFrame:
+    """
+    Load summary baseline 7: XGB tabular + advanced graph features (projected/homo5/hetero5).
+    File: PROC_DIR/predictions/baseline_7/summary_xgb_tabular_graphfeat_raw_targets.csv
+    """
+    path = (
+        PROC_DIR
+        / "predictions"
+        / "baseline_7"
+        / "summary_xgb_tabular_graphfeat_raw_targets.csv"
+    )
+    if not path.exists():
+        print(f"[BL7] Not found: {path}")
+        return pd.DataFrame()
+
+    df = pd.read_csv(path)
+
+    # đảm bảo meta columns
+    if "model_family" not in df.columns:
+        df["model_family"] = "xgb_tabular_graphfeat"
+
+    if "graph_type" not in df.columns:
+        # fallback: suy ra từ variant nếu cần
+        def _infer_gt(v: str) -> str:
+            if isinstance(v, str):
+                vl = v.lower()
+                if "projected" in vl:
+                    return "projected"
+                if "homo5" in vl:
+                    return "homo5"
+                if "hetero5" in vl:
+                    return "hetero5"
+            return "graphfeat"
+        df["graph_type"] = df.get("graph_type", df.get("variant", "")).apply(_infer_gt)
+
+    if "edge_view" not in df.columns:
+        df["edge_view"] = None
+
+    if "target_transform" not in df.columns:
+        if "target_type" in df.columns:
+            df["target_transform"] = df["target_type"]
+        else:
+            df["target_transform"] = "raw"
+
+    if "variant" not in df.columns:
+        df["variant"] = "baseline_7_xgb_tabular_graphfeat"
+
+    # đảm bảo có cột 'tag' (nếu file không có, tạo default)
+    if "tag" not in df.columns:
+        df["tag"] = (
+            "xgb_tabular_graphfeat_"
+            + df["graph_type"].astype(str)
+            + "_h"
+            + df["horizon"].astype(str)
+            + "_lag"
+            + df["lag_window"].astype(str)
+            + "_"
+            + df["temporal_type"].astype(str)
+        )
+
+    return df
 
 def main():
     dfs = []
@@ -326,12 +456,23 @@ def main():
     df_b3 = load_baseline3_xgb_graph()
     if not df_b3.empty:
         dfs.append(harmonize_columns(df_b3))
+
     df_b5 = load_baseline5_xgb_gnn_embed()
     if not df_b5.empty:
         dfs.append(harmonize_columns(df_b5))
+
     df_gnn = load_gnn_summary()
     if not df_gnn.empty:
         dfs.append(harmonize_columns(df_gnn))
+
+    df_b6 = load_baseline6_residual_xgb_gnn()
+    if not df_b6.empty:
+        dfs.append(harmonize_columns(df_b6))
+
+    # baseline 7: xgb + advanced graph features
+    df_b7 = load_baseline7_baseline_7()
+    if not df_b7.empty:
+        dfs.append(harmonize_columns(df_b7))
 
     if not dfs:
         print("No summary files found, nothing to aggregate.")
@@ -360,7 +501,6 @@ def main():
 
     print(f"Aggregated {len(df_all)} rows into {out_path}")
     print(df_all.head())
-
 
 if __name__ == "__main__":
     main()

@@ -46,6 +46,7 @@ EDGE_TYPE_PRODUCT_STORAGE = "product_storage"
 
 HORIZON = 7
 
+
 def load_node_metadata() -> pd.DataFrame:
     node_index_path = NODE_DIR / "NodesIndex.csv"
     node_group_path = NODE_DIR / "Node Types (Product Group and Subgroup).csv"
@@ -63,13 +64,18 @@ def load_node_metadata() -> pd.DataFrame:
 
     df_plant = pd.read_csv(node_plant_storage_path)
     df_plant = df_plant.rename(
-        columns={ "Node": "node_id", "Plant": "plant", "Storage Location": "storage_location",}
+        columns={
+            "Node": "node_id",
+            "Plant": "plant",
+            "Storage Location": "storage_location",
+        }
     )
     df_plant = df_plant.drop_duplicates(keep="first")
 
     df_meta = df_index.merge(df_group, on="node_id", how="left")
     df_meta = df_meta.merge(df_plant, on="node_id", how="left")
     return df_meta
+
 
 def sanity_check_alignment(df_meta: pd.DataFrame):
     temporal_types = sorted({exp.temporal_type for exp in DEFAULT_EXPERIMENTS})
@@ -111,6 +117,7 @@ def sanity_check_alignment(df_meta: pd.DataFrame):
                 f"[SanityCheck][{temporal_type}] OK: "
                 f"product node_id/node_index aligned ({len(merged)} nodes)."
             )
+
 
 def build_homogeneous_5type_graph(df_meta: pd.DataFrame) -> nx.Graph:
     G = nx.Graph()
@@ -212,6 +219,7 @@ def build_homogeneous_5type_graph(df_meta: pd.DataFrame) -> nx.Graph:
     print("[Homogeneous-5type] Saved edge list")
 
     return G
+
 
 def build_heterogeneous_5type_graph(df_meta: pd.DataFrame) -> nx.MultiDiGraph:
     G = nx.MultiDiGraph()
@@ -317,6 +325,7 @@ def build_heterogeneous_5type_graph(df_meta: pd.DataFrame) -> nx.MultiDiGraph:
 
     return G
 
+
 def build_projected_graph(df_meta: pd.DataFrame, by_col: str, out_name: str) -> nx.Graph:
     G = nx.Graph()
 
@@ -378,6 +387,7 @@ def build_all_projected_graphs(df_meta: pd.DataFrame):
     build_projected_graph(df_meta, "plant", "product_graph_same_plant")
     build_projected_graph(df_meta, "storage_location", "product_graph_same_storage")
     print(f"[Projected] Built all 4 projected product graphs in {PROJ_DIR}")
+
 
 def is_graph_side_ohe(col: str) -> bool:
     col_lower = col.lower()
@@ -476,6 +486,105 @@ def build_time_tensors_from_xgb_for_gnn(df: pd.DataFrame):
     return pkg_common, nodeindex2pos
 
 
+def build_residual_time_tensors_for_gnn(
+    df_xgb_tabular: pd.DataFrame,
+    df_xgb_pred: pd.DataFrame,
+    is_log1p: bool = False,
+):
+    """
+    Tạo tensor cho baseline 6 (residual GNN):
+    - X_residual: giống X_product nhưng append thêm 1 feature cuối là y_xgb
+    - R_residual: residual trên scale phù hợp (raw hoặc log1p).
+    """
+    df = df_xgb_tabular.copy()
+    df_pred = df_xgb_pred.copy()
+
+    df["node_index"] = df["node_index"].astype(int)
+    df["day"] = df["day"].astype(int)
+    df_pred["node_index"] = df_pred["node_index"].astype(int)
+    df_pred["day"] = df_pred["day"].astype(int)
+
+    # join y_xgb vào tabular
+    df = df.merge(
+        df_pred[["node_id", "node_index", "date", "day", "y_xgb"]],
+        on=["node_id", "node_index", "date", "day"],
+        how="left",
+        validate="1:1",
+    )
+
+    # index mapping giống build_time_tensors_from_xgb_for_gnn
+    node_indices = np.sort(df["node_index"].dropna().unique())
+    nodeindex2pos = {int(idx): i for i, idx in enumerate(node_indices)}
+    N = len(node_indices)
+
+    days = np.sort(df["day"].dropna().unique())
+    day2idx = {int(d): i for i, d in enumerate(days)}
+    T = len(days)
+
+    drop_base = ["node_id", "node_index", "date", "day", "split", "target", "y_xgb"]
+    feature_cols = []
+    for c in df.columns:
+        if c in drop_base:
+            continue
+        if is_graph_side_ohe(c):
+            continue
+        feature_cols.append(c)
+    feature_cols_res = feature_cols + ["y_xgb"]
+    Fdim = len(feature_cols_res)
+
+    print(f"[GNN-RESID] #days={T}, #prod_nodes={N}, #features={Fdim} (include y_xgb)")
+
+    X = np.zeros((T, N, Fdim), dtype=np.float32)
+    R = np.full((T, N), np.nan, dtype=np.float32)
+
+    df_sorted = df.sort_values(["day", "node_index"])
+    for _, row in df_sorted.iterrows():
+        t = day2idx[int(row["day"])]
+        n = nodeindex2pos[int(row["node_index"])]
+
+        x_feats = row[feature_cols].values.astype(np.float32)
+        y_xgb = float(row["y_xgb"])
+        y_true = float(row["target"])
+
+        X[t, n, :-1] = x_feats
+        X[t, n, -1] = y_xgb
+
+        if np.isnan(y_true) or np.isnan(y_xgb):
+            continue
+
+        if is_log1p:
+            z_true = np.log1p(max(y_true, 0.0))
+            z_xgb = np.log1p(max(y_xgb, 0.0))
+            R[t, n] = z_true - z_xgb
+        else:
+            R[t, n] = y_true - y_xgb
+
+    day_split = (
+        df.groupby("day")["split"]
+        .first()
+        .sort_index()
+        .values
+    )
+
+    df_nodes = (
+        df[["node_id", "node_index"]]
+        .drop_duplicates(subset=["node_index"])
+        .sort_values("node_index")
+    )
+    node_ids_sorted = df_nodes["node_id"].values
+
+    pkg_res = {
+        "X_residual": torch.from_numpy(X),
+        "R_residual": torch.from_numpy(R),
+        "days": torch.tensor(days, dtype=torch.long),
+        "split": day_split,
+        "node_ids_product": node_ids_sorted,
+        "node_index_product": torch.tensor(node_indices, dtype=torch.long),
+        "feature_cols_residual": feature_cols_res,
+    }
+    return pkg_res, nodeindex2pos
+
+
 def load_projected_edge_parquet(out_name: str) -> pd.DataFrame:
     return pd.read_parquet(PROJ_DIR / f"{out_name}_edges.parquet")
 
@@ -497,8 +606,14 @@ def build_projected_edge_indices(nodeindex2pos_prod: Dict[int, int], df_meta: pd
             idx_d = nodeid2index[d]
             if idx_s not in nodeindex2pos_prod or idx_d not in nodeindex2pos_prod:
                 continue
-            src_pos.append(nodeindex2pos_prod[idx_s])
-            dst_pos.append(nodeindex2pos_prod[idx_d])
+            s_pos = nodeindex2pos_prod[idx_s]
+            d_pos = nodeindex2pos_prod[idx_d]
+            # thêm cả hai chiều (s -> d) và (d -> s)
+            src_pos.append(s_pos)
+            dst_pos.append(d_pos)
+            src_pos.append(d_pos)
+            dst_pos.append(s_pos)
+
         if len(src_pos) == 0:
             return torch.empty((2, 0), dtype=torch.long)
         arr = np.vstack([src_pos, dst_pos])
@@ -533,7 +648,8 @@ def build_homo5type_from_parquet():
 
     type_groups = {}
     for nt in nodes_tbl["node_type"].unique():
-        df_nt = nodes_tbl[nodes_tbl["node_type"] == nt].copy().reset_index(drop=True)
+        df_nt = nodes_tbl[nodes_tbl["node_type"] == nt].copy()
+        df_nt = df_nt.reset_index(drop=True)
         type_groups[nt] = df_nt
 
     nodeid2type = {}
@@ -541,7 +657,7 @@ def build_homo5type_from_parquet():
     num_nodes_dict = {}
     for nt, df_nt in type_groups.items():
         num_nodes_dict[nt] = len(df_nt)
-        for i, row in df_nt.reset_index().iterrows():
+        for i, row in df_nt.iterrows():   # KHÔNG reset_index lại
             nid = str(row["node_id"])
             nodeid2type[nid] = nt
             nodeid2local[nid] = int(i)
@@ -600,7 +716,8 @@ def build_hetero5type_from_parquet():
     nodes_tbl["node_id"] = nodes_tbl["node_id"].astype(str)
     type_groups = {}
     for nt in nodes_tbl["node_type"].unique():
-        df_nt = nodes_tbl[nodes_tbl["node_type"] == nt].copy().reset_index(drop=True)
+        df_nt = nodes_tbl[nodes_tbl["node_type"] == nt].copy()
+        df_nt = df_nt.reset_index(drop=True)
         type_groups[nt] = df_nt
 
     nodeid2type = {}
@@ -608,7 +725,7 @@ def build_hetero5type_from_parquet():
     num_nodes_dict = {}
     for nt, df_nt in type_groups.items():
         num_nodes_dict[nt] = len(df_nt)
-        for i, row in df_nt.reset_index().iterrows():
+        for i, row in df_nt.iterrows():
             nid = str(row["node_id"])
             nodeid2type[nid] = nt
             nodeid2local[nid] = int(i)
@@ -656,6 +773,52 @@ def build_hetero5type_from_parquet():
 
     return edge_index_dict, num_nodes_dict, nodes_tbl
 
+
+def make_homo5_flat_edge_index(
+    edge_index_dict,
+    num_nodes_dict: dict,
+    node_type_order: list,
+) -> torch.Tensor:
+    """
+    Chuyển edge_index_dict với index local từng node_type
+    thành edge_index_flat [2, E_total] trên không gian node global,
+    phù hợp với HomogeneousFiveTypeGINEncoder / Regressor.
+
+    edge_index_dict: {(src_type, rel, dst_type): tensor[2, E_rel]}
+    num_nodes_dict: {node_type: num_nodes}
+    node_type_order: [node_type_0, node_type_1, ...] (thứ tự concat)
+    """
+    offsets = {}
+    offset = 0
+    for nt in node_type_order:
+        offsets[nt] = offset
+        offset += num_nodes_dict[nt]
+
+    all_src = []
+    all_dst = []
+
+    for (src_type, rel_name, dst_type), ei in edge_index_dict.items():
+        if ei.numel() == 0:
+            continue
+        ei = ei.long()
+        src_local = ei[0]
+        dst_local = ei[1]
+
+        src_global = offsets[src_type] + src_local
+        dst_global = offsets[dst_type] + dst_local
+
+        all_src.append(src_global)
+        all_dst.append(dst_global)
+
+    if not all_src:
+        return torch.empty((2, 0), dtype=torch.long)
+
+    src_cat = torch.cat(all_src, dim=0)
+    dst_cat = torch.cat(all_dst, dim=0)
+    edge_index_flat = torch.stack([src_cat, dst_cat], dim=0)
+    return edge_index_flat
+
+
 def build_gnn_datasets_for_config(temporal_type: str, lag_window: int, df_meta: pd.DataFrame):
     print(
         f"\n=== Build GNN datasets (projected/homo5/hetero5) "
@@ -665,6 +828,7 @@ def build_gnn_datasets_for_config(temporal_type: str, lag_window: int, df_meta: 
     df_xgb = load_xgb_tabular_for_gnn(temporal_type, lag_window, HORIZON)
     pkg_common, nodeindex2pos_prod = build_time_tensors_from_xgb_for_gnn(df_xgb)
 
+    # 1) Projected product graph (4 view)
     edge_index_proj = build_projected_edge_indices(nodeindex2pos_prod, df_meta)
     pkg_proj = {
         **pkg_common,
@@ -675,10 +839,20 @@ def build_gnn_datasets_for_config(temporal_type: str, lag_window: int, df_meta: 
     torch.save(pkg_proj, out_proj)
     print(f"[GNN-SAVE] projected dataset -> {out_proj}")
 
+    # 2) Homogeneous 5-type
     edge_index_homo5, num_nodes_homo5, nodes_homo_tbl = build_homo5type_from_parquet()
+
+    node_type_order = sorted(nodes_homo_tbl["node_type"].unique().tolist())
+    edge_index_flat = make_homo5_flat_edge_index(
+        edge_index_dict=edge_index_homo5,
+        num_nodes_dict=num_nodes_homo5,
+        node_type_order=node_type_order,
+    )
+
     pkg_homo5 = {
         **pkg_common,
         "edge_index_dict": edge_index_homo5,
+        "edge_index": edge_index_flat,
         "num_nodes_dict": num_nodes_homo5,
         "nodes_homo_table": nodes_homo_tbl,
         "graph_def": "homogeneous_5node_types",
@@ -687,6 +861,7 @@ def build_gnn_datasets_for_config(temporal_type: str, lag_window: int, df_meta: 
     torch.save(pkg_homo5, out_homo5)
     print(f"[GNN-SAVE] homo5 dataset -> {out_homo5}")
 
+    # 3) Heterogeneous 5-type
     edge_index_het5, num_nodes_het5, nodes_het_tbl = build_hetero5type_from_parquet()
     pkg_het5 = {
         **pkg_common,
@@ -698,6 +873,7 @@ def build_gnn_datasets_for_config(temporal_type: str, lag_window: int, df_meta: 
     out_het5 = GNN_DIR / f"gnn_hetero5_h{HORIZON}_lag{lag_window}_{temporal_type}.pt"
     torch.save(pkg_het5, out_het5)
     print(f"[GNN-SAVE] hetero5 dataset -> {out_het5}")
+
 
 def compute_projected_graph_features(df_meta: pd.DataFrame) -> pd.DataFrame:
     def degree_and_basic_stats(G: nx.Graph, suffix: str) -> pd.DataFrame:
@@ -814,7 +990,6 @@ def compute_homo_graph_features() -> pd.DataFrame:
 
 
 def compute_hetero_graph_features() -> pd.DataFrame:
-
     with open(HETERO_DIR / "heterogeneous_5node_types.gpickle", "rb") as f:
         G_multi: nx.MultiDiGraph = pickle.load(f)
 
@@ -888,17 +1063,14 @@ def build_xgb_graph_baselines_for_config(temporal_type: str, horizon: int, lag_w
     df_proj_feat = compute_projected_graph_features(df_meta)
     df_proj_feat["node_id"] = df_proj_feat["node_id"].astype(str)
 
-    # đảm bảo 1 dòng / (node_id,node_index)
     df_proj_feat = df_proj_feat.drop_duplicates(subset=["node_id", "node_index"])
-
-    # base time series cũng đảm bảo unique trên (node_id,date)
     df_xgb = df_xgb.drop_duplicates(subset=["node_id", "node_index", "date"])
 
     df_proj = df_xgb.merge(
         df_proj_feat,
         on=["node_id", "node_index"],
         how="left",
-        validate="m:1",  # mỗi (node_id,node_index,date) map tới 1 dòng graph feature
+        validate="m:1",
     ).fillna(0.0)
     out_proj = XGB_GRAPH_DIR / f"xgboost_tabular_graph_projected_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     df_proj.to_parquet(out_proj, index=False)
@@ -929,6 +1101,7 @@ def build_xgb_graph_baselines_for_config(temporal_type: str, horizon: int, lag_w
     out_het = XGB_GRAPH_DIR / f"xgboost_tabular_graph_hetero5_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     df_het.to_parquet(out_het, index=False)
     print(f"[XGB-GRAPH] saved hetero5 graph baseline -> {out_het}")
+
 
 def main():
     df_meta = load_node_metadata()

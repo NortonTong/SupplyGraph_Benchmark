@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 import matplotlib.pyplot as plt
+import torch.nn.functional as F
 
 from models_gnn import (
     ProjectedGINRegressor,
@@ -21,7 +22,38 @@ PROJECTED_VIEWS = ["same_group", "same_subgroup", "same_plant", "same_storage"]
 
 
 # =========================
-# EarlyStopping helper
+# Transform helpers: train trên z, eval trên y
+# =========================
+
+def transform_y_tensor(y: torch.Tensor, is_softplus: bool, is_log1p: bool) -> torch.Tensor:
+    """
+    Biến đổi y (scale gốc, >=0) sang z cho training.
+    - log1p: z = log1p(y)
+    - softplus: z = softplus^{-1}(y) ~ log(exp(y)-1)
+    - raw: z = y
+    """
+    y = y.clamp_min(0.0)
+    if is_softplus:
+        return torch.log(torch.expm1(y).clamp_min(1e-8))
+    if is_log1p:
+        return torch.log1p(y)
+    return y
+
+
+def inverse_transform_y_tensor(z: torch.Tensor, is_softplus: bool, is_log1p: bool) -> torch.Tensor:
+    """
+    Biến đổi logits z về y trên scale gốc.
+    Đồng thời CLIP >= 0 ở mọi mode (đặc biệt raw).
+    Dùng trong evaluation.
+    """
+    if is_softplus:
+        return F.softplus(z).clamp_min(0.0)
+    if is_log1p:
+        return torch.expm1(z).clamp_min(0.0)
+    # RAW MODE: clamp để tránh dự đoán âm
+    return z.clamp_min(0.0)
+# =========================
+# EarlyStopping
 # =========================
 
 class EarlyStopping:
@@ -143,12 +175,6 @@ def plot_predictions_per_product(
     graph_tag: str,
     max_plots: int | None = None,
 ) -> None:
-    """
-    Vẽ y_true vs y_pred theo ngày cho từng sản phẩm trên test split.
-    Lưu 1 file .png / sản phẩm vào out_dir, prefix theo graph_tag.
-    days_test: [T_test]
-    y_true_test, y_pred_test: [T_test, N_prod]
-    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -206,8 +232,9 @@ def run_projected_gnn_baseline(
         f"[mode={mode_name}] ==="
     )
 
-    X = pkg["X_product"].float()  # [T, N, F]
-    Y = pkg["Y_product"].float()  # [T, N]
+    X = pkg["X_product"].float()   # [T, N, F]
+    Y = pkg["Y_product"].float()   # [T, N] (scale gốc)
+    Y_trans = transform_y_tensor(Y, is_softplus, is_log1p)  # [T, N]
     days = np.array(pkg["days"])
     split = pkg["split"]
     edge_index_dict = pkg["edge_index_dict"]
@@ -228,9 +255,8 @@ def run_projected_gnn_baseline(
         is_log1p=is_log1p,
     ).to(device)
     edge_index = edge_index.to(device)
-    
+
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-    
     loss_fn = nn.MSELoss()
     early_stopper = EarlyStopping(patience=es_patience, min_delta=es_min_delta)
 
@@ -245,15 +271,24 @@ def run_projected_gnn_baseline(
         for start in range(0, len(day_indices), batch_days):
             idx_block = day_indices[start:start + batch_days]
             X_block = X[idx_block].to(device)
-            Y_block = Y[idx_block].to(device)
+            Y_block = Y_trans[idx_block].to(device)  # z_true, có thể chứa NaN
+
+            if X_block.size(0) == 0:
+                continue
 
             loss_block = 0.0
             for b in range(X_block.size(0)):
-                x_b = X_block[b]
-                y_b = Y_block[b]
+                x_b = X_block[b]    # [N, F]
+                z_true_b = Y_block[b]  # [N]
 
-                y_hat_b = model(x_b, edge_index)
-                loss_b = loss_fn(y_hat_b, y_b)
+                z_pred_b = model(x_b, edge_index)  # logits
+
+                # Mask NaN / inf
+                mask = torch.isfinite(z_true_b)
+                if mask.sum() == 0:
+                    continue
+
+                loss_b = loss_fn(z_pred_b[mask], z_true_b[mask])
                 loss_block += loss_b
 
             loss_block = loss_block / X_block.size(0)
@@ -266,7 +301,6 @@ def run_projected_gnn_baseline(
             count += 1
 
         return total_loss / max(count, 1)
-
     for epoch in range(1, epochs + 1):
         train_loss = iterate_days(idx_train, train_mode=True)
         val_loss = iterate_days(idx_val, train_mode=False)
@@ -283,16 +317,17 @@ def run_projected_gnn_baseline(
 
     with torch.no_grad():
         def predict_on_indices(idxs):
-            preds_t = []
-            trues = []
+            y_true_list = []
+            y_pred_list = []
             for t in idxs:
                 x_t = X[t].to(device)
-                y_t = Y[t].to(device)
-                y_hat_t = model(x_t, edge_index)
-                preds_t.append(y_hat_t.cpu().numpy())
-                trues.append(y_t.cpu().numpy())
-            return np.concatenate(trues), np.concatenate(preds_t)
+                y_t = Y[t].to(device)            
+                z_pred_t = model(x_t, edge_index)  
+                y_hat_t = inverse_transform_y_tensor(z_pred_t, is_softplus, is_log1p)
 
+                y_true_list.append(y_t.cpu().numpy())
+                y_pred_list.append(y_hat_t.cpu().numpy())
+            return np.concatenate(y_true_list), np.concatenate(y_pred_list)
         y_train_true, y_train_pred_flat = predict_on_indices(idx_train)
         y_val_true, y_val_pred_flat = predict_on_indices(idx_val)
         y_test_true_flat, y_test_pred_flat = predict_on_indices(idx_test)
@@ -337,7 +372,6 @@ def run_projected_gnn_baseline(
     print(f"  MAPE : {mape_test:.4f}")
     print(f"  sMAPE: {smape_test:.4f}")
 
-    # CSV test predictions
     out_pred_dir = base_dir / "csv" / "projected"
     out_pred_dir.mkdir(parents=True, exist_ok=True)
     df_test_pred = pd.DataFrame(
@@ -352,7 +386,6 @@ def run_projected_gnn_baseline(
     df_test_pred.to_csv(out_pred_file, index=False)
     print(f"[SAVE] Test predictions saved to {out_pred_file}")
 
-    # plots
     out_plot_dir = base_dir / "plots_projected"
     plot_predictions_per_product(
         days_test=days_test,
@@ -421,37 +454,14 @@ def run_homo5_gnn_baseline(
 
     X_prod = pkg["X_product"].float()
     Y_prod = pkg["Y_product"].float()
+    Y_trans = transform_y_tensor(Y_prod, is_softplus, is_log1p)
     days = np.array(pkg["days"])
     split = pkg["split"]
-    edge_index_dict = pkg["edge_index_dict"]
+
+    edge_index = pkg["edge_index"]          # [2, E_total] flatten
     num_nodes_dict = pkg["num_nodes_dict"]
-
-    node_type_order = list(num_nodes_dict.keys())
-
-    offsets = {}
-    offset = 0
-    for nt in node_type_order:
-        offsets[nt] = offset
-        offset += num_nodes_dict[nt]
-    N_total = offset
-
-    all_edges = []
-    for (src_type, rel_name, dst_type), ei in edge_index_dict.items():
-        if ei.numel() == 0:
-            continue
-        src_offset = offsets[src_type]
-        dst_offset = offsets[dst_type]
-        src_global = ei[0, :] + src_offset
-        dst_global = ei[1, :] + dst_offset
-        all_edges.append(torch.stack([src_global, dst_global], dim=0))
-        all_edges.append(torch.stack([dst_global, src_global], dim=0))
-
-    if len(all_edges) == 0:
-        edge_index = torch.empty((2, 0), dtype=torch.long)
-    else:
-        edge_index = torch.cat(all_edges, dim=1)
-
-    print(f"[Homo5] N_total={N_total}, edges={edge_index.size(1)}")
+    nodes_tbl = pkg["nodes_homo_table"]
+    node_type_order = nodes_tbl["node_type"].unique().tolist()
 
     T, N_prod, Fdim = X_prod.shape
     idx_train, idx_val, idx_test = get_time_splits(days, split)
@@ -486,12 +496,15 @@ def run_homo5_gnn_baseline(
         for start in range(0, len(day_indices), batch_days):
             idx_block = day_indices[start:start + batch_days]
             X_block = X_prod[idx_block].to(device)
-            Y_block = Y_prod[idx_block].to(device)
+            Y_block = Y_trans[idx_block].to(device)
+
+            if X_block.size(0) == 0:
+                continue
 
             loss_block = 0.0
             for b in range(X_block.size(0)):
-                x_prod_b = X_block[b]
-                y_b = Y_block[b]
+                x_prod_b = X_block[b]   # [N_prod, F]
+                z_true_b = Y_block[b]   # [N_prod]
 
                 x_dict = {
                     "product": x_prod_b,
@@ -501,8 +514,13 @@ def run_homo5_gnn_baseline(
                     },
                 }
 
-                y_hat_b = model(x_dict, edge_index)
-                loss_b = loss_fn(y_hat_b, y_b)
+                z_pred_b = model(x_dict, edge_index)  # logits
+
+                mask = torch.isfinite(z_true_b)
+                if mask.sum() == 0:
+                    continue
+
+                loss_b = loss_fn(z_pred_b[mask], z_true_b[mask])
                 loss_block += loss_b
 
             loss_block = loss_block / X_block.size(0)
@@ -515,7 +533,6 @@ def run_homo5_gnn_baseline(
             count += 1
 
         return total_loss / max(count, 1)
-
     for epoch in range(1, epochs + 1):
         train_loss = iterate_days(idx_train, train_mode=True)
         val_loss = iterate_days(idx_val, train_mode=False)
@@ -530,11 +547,12 @@ def run_homo5_gnn_baseline(
 
     with torch.no_grad():
         def predict_on_indices(idxs):
-            preds_t = []
-            trues = []
+            y_true_list = []
+            y_pred_list = []
             for t in idxs:
                 x_prod_t = X_prod[t].to(device)
                 y_t = Y_prod[t].to(device)
+
                 x_dict_t = {
                     "product": x_prod_t,
                     **{
@@ -542,17 +560,17 @@ def run_homo5_gnn_baseline(
                         for nt in other_types
                     },
                 }
-                y_hat_t = model(x_dict_t, edge_index)
-                preds_t.append(y_hat_t.cpu().numpy())
-                trues.append(y_t.cpu().numpy())
-            return np.concatenate(trues), np.concatenate(preds_t)
+                z_pred_t = model(x_dict_t, edge_index) 
+                y_hat_t = inverse_transform_y_tensor(z_pred_t, is_softplus, is_log1p)
 
+                y_true_list.append(y_t.cpu().numpy())
+                y_pred_list.append(y_hat_t.cpu().numpy())
+            return np.concatenate(y_true_list), np.concatenate(y_pred_list)
         y_train_true, y_train_pred_flat = predict_on_indices(idx_train)
         y_val_true, y_val_pred_flat = predict_on_indices(idx_val)
         y_test_true_flat, y_test_pred_flat = predict_on_indices(idx_test)
 
     T_test = len(idx_test)
-    N_prod = Y_prod.shape[1]
     y_test_true = y_test_true_flat.reshape(T_test, N_prod)
     y_test_pred = y_test_pred_flat.reshape(T_test, N_prod)
     days_test = days[idx_test]
@@ -674,6 +692,7 @@ def run_hetero5_gnn_baseline(
 
     X_prod = pkg["X_product"].float()
     Y_prod = pkg["Y_product"].float()
+    Y_trans = transform_y_tensor(Y_prod, is_softplus, is_log1p)
     days = np.array(pkg["days"])
     split = pkg["split"]
     edge_index_dict = pkg["edge_index_dict"]
@@ -717,18 +736,26 @@ def run_hetero5_gnn_baseline(
         for start in range(0, len(day_indices), batch_days):
             idx_block = day_indices[start:start + batch_days]
             X_block = X_prod[idx_block].to(device)
-            Y_block = Y_prod[idx_block].to(device)
+            Y_block = Y_trans[idx_block].to(device)
+
+            if X_block.size(0) == 0:
+                continue
 
             loss_block = 0.0
             for b in range(X_block.size(0)):
                 x_prod_b = X_block[b]
-                y_b = Y_block[b]
+                z_true_b = Y_block[b]
 
                 x_dict = {nt: base_x_dict[nt].to(device) for nt in base_x_dict.keys()}
                 x_dict["product"] = x_prod_b
 
-                y_hat_b = model(x_dict, edge_index_dict)
-                loss_b = loss_fn(y_hat_b, y_b)
+                z_pred_b = model(x_dict, edge_index_dict)   # logits
+
+                mask = torch.isfinite(z_true_b)
+                if mask.sum() == 0:
+                    continue
+
+                loss_b = loss_fn(z_pred_b[mask], z_true_b[mask])
                 loss_block += loss_b
 
             loss_block = loss_block / X_block.size(0)
@@ -741,7 +768,6 @@ def run_hetero5_gnn_baseline(
             count += 1
 
         return total_loss / max(count, 1)
-
     for epoch in range(1, epochs + 1):
         train_loss = iterate_days(idx_train, train_mode=True)
         val_loss = iterate_days(idx_val, train_mode=False)
@@ -756,8 +782,8 @@ def run_hetero5_gnn_baseline(
 
     with torch.no_grad():
         def predict_on_indices(idxs):
-            preds_t = []
-            trues = []
+            y_true_list = []
+            y_pred_list = []
             for t in idxs:
                 x_prod_t = X_prod[t].to(device)
                 y_t = Y_prod[t].to(device)
@@ -765,11 +791,14 @@ def run_hetero5_gnn_baseline(
                 x_dict = {nt: base_x_dict[nt].to(device) for nt in base_x_dict.keys()}
                 x_dict["product"] = x_prod_t
 
-                y_hat_t = model(x_dict, edge_index_dict)
-                preds_t.append(y_hat_t.cpu().numpy())
-                trues.append(y_t.cpu().numpy())
-            return np.concatenate(trues), np.concatenate(preds_t)
+                z_pred_t = model(x_dict, edge_index_dict)  # logits
 
+                # >>> clip ở đây <<<
+                y_hat_t = inverse_transform_y_tensor(z_pred_t, is_softplus, is_log1p)
+
+                y_true_list.append(y_t.cpu().numpy())
+                y_pred_list.append(y_hat_t.cpu().numpy())
+            return np.concatenate(y_true_list), np.concatenate(y_pred_list)
         y_train_true, y_train_pred_flat = predict_on_indices(idx_train)
         y_val_true, y_val_pred_flat = predict_on_indices(idx_val)
         y_test_true_flat, y_test_pred_flat = predict_on_indices(idx_test)
@@ -866,7 +895,7 @@ def run_hetero5_gnn_baseline(
 
 
 # =========================
-# main: chạy lần lượt 3 graph type cho từng ExperimentConfig
+# main
 # =========================
 
 def main():

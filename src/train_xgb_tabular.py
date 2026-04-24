@@ -13,7 +13,7 @@ for exp in experiment:
     TEMPORAL_TYPE = exp.temporal_type
     HORIZON = list(exp.horizons)[0]
     LAG_WINDOWS = list(exp.gru_seq_lengths)
-        
+
 RUN_SUMMARY: list[dict] = []
 
 
@@ -47,7 +47,8 @@ def load_tabular_baseline(
 ) -> pd.DataFrame:
     """
     Load file baseline XGBoost đã được preprocessing + OHE,
-    ví dụ: data/processed/baseline/xgboost/xgboost_tabular_h{HORIZON}_lag{lag_window}_{temporal_type}.parquet
+    ví dụ:
+    data/processed/baseline/xgboost/xgboost_tabular_h{HORIZON}_lag{lag_window}_{temporal_type}.parquet
     """
     path = (
         PROC_DIR
@@ -275,31 +276,36 @@ def train_xgb_tabular_baseline(
     print(f"  MAPE  : {mape_test:.4f}")
     print(f"  sMAPE : {smape_test:.4f}")
 
-    RUN_SUMMARY.append(
-        {
-            "temporal_type": temporal_type,
-            "lag_window": lag_window,
-            "horizon": HORIZON,
-            "variant": f"baseline_1_xgb_tabular_{target_type}",
-            "tag": tag,
-            "target_type": target_type,
-            "n_features": X_train.shape[1],
-            "MAE_train": mae_train,
-            "RMSE_train": rmse_train,
-            "MAPE_train": mape_train,
-            "sMAPE_train": smape_train,
-            "MAE_val": mae_val,
-            "RMSE_val": rmse_val,
-            "MAPE_val": mape_val,
-            "sMAPE_val": smape_val,
-            "MAE_test": mae_test,
-            "RMSE_test": rmse_test,
-            "MAPE_test": mape_test,
-            "sMAPE_test": smape_test,
-        }
+    # 6.1) Lưu full predictions (train + val + test) cho baseline 6 (GNN residual)
+    df_train_pred = df_train[["node_id", "node_index", "date", "day"]].copy()
+    df_train_pred["split"] = "train"
+    df_train_pred["y_xgb"] = y_train_pred
+
+    df_val_pred = df_val[["node_id", "node_index", "date", "day"]].copy()
+    df_val_pred["split"] = "val"
+    df_val_pred["y_xgb"] = y_val_pred
+
+    df_test_pred_full = df_test[["node_id", "node_index", "date", "day"]].copy()
+    df_test_pred_full["split"] = "test"
+    df_test_pred_full["y_xgb"] = y_test_pred
+
+    df_all_pred = pd.concat(
+        [df_train_pred, df_val_pred, df_test_pred_full],
+        axis=0,
+        ignore_index=True,
     )
 
-    # 7) Save test predictions & plots per product
+    pred_path = (
+        PROC_DIR
+        / "baseline"
+        / "xgboost"
+        / f"xgboost_predictions_h{HORIZON}_lag{lag_window}_{temporal_type}.parquet"
+    )
+    pred_path.parent.mkdir(parents=True, exist_ok=True)
+    df_all_pred.to_parquet(pred_path, index=False)
+    print(f"[XGB] Saved full predictions for residual GNN to {pred_path}")
+
+    # 7) Save test predictions & plots per product (cho baseline 1 phân tích)
     base_pred_dir = PROC_DIR / "predictions" / "baseline_1"
     out_dir_csv = base_pred_dir / "csv" / f"{temporal_type}"
     plot_folder = f"{target_type}_lag{lag_window}"
@@ -329,6 +335,30 @@ def train_xgb_tabular_baseline(
         max_plots=None,
     )
     print(f"Saved per-product prediction plots to {out_dir_plot}")
+
+    RUN_SUMMARY.append(
+        {
+            "temporal_type": temporal_type,
+            "lag_window": lag_window,
+            "horizon": HORIZON,
+            "variant": f"baseline_1_xgb_tabular_{target_type}",
+            "tag": tag,
+            "target_type": target_type,
+            "n_features": X_train.shape[1],
+            "MAE_train": mae_train,
+            "RMSE_train": rmse_train,
+            "MAPE_train": mape_train,
+            "sMAPE_train": smape_train,
+            "MAE_val": mae_val,
+            "RMSE_val": rmse_val,
+            "MAPE_val": mape_val,
+            "sMAPE_val": smape_val,
+            "MAE_test": mae_test,
+            "RMSE_test": rmse_test,
+            "MAPE_test": mape_test,
+            "sMAPE_test": smape_test,
+        }
+    )
 
 
 # =========================
