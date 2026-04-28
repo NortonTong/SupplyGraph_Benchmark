@@ -326,9 +326,12 @@ def build_heterogeneous_5type_graph(df_meta: pd.DataFrame) -> nx.MultiDiGraph:
     return G
 
 
+import networkx as nx
+
 def build_projected_graph(df_meta: pd.DataFrame, by_col: str, out_name: str) -> nx.Graph:
     G = nx.Graph()
 
+    # add product nodes
     for _, row in df_meta.iterrows():
         G.add_node(
             row["node_id"],
@@ -339,6 +342,7 @@ def build_projected_graph(df_meta: pd.DataFrame, by_col: str, out_name: str) -> 
             storage_location=row.get("storage_location"),
         )
 
+    # add projected edges
     df_valid = df_meta.dropna(subset=[by_col])
     for _, grp in df_valid.groupby(by_col):
         nodes = grp["node_id"].tolist()
@@ -349,13 +353,23 @@ def build_projected_graph(df_meta: pd.DataFrame, by_col: str, out_name: str) -> 
             u = nodes[i]
             for j in range(i + 1, n):
                 v = nodes[j]
+                if u == v:
+                    continue  # safety
                 if not G.has_edge(u, v):
                     G.add_edge(u, v)
 
+    # remove any self-loops that might still exist (from old data / bugs)
+    self_loops = list(nx.selfloop_edges(G))
+    if self_loops:
+        print(f"[Projected][{out_name}] Removing {len(self_loops)} self-loops")
+        G.remove_edges_from(self_loops)
+
     print(
-        f"[Projected] {out_name} via {by_col}: |V|={G.number_of_nodes()}, |E|={G.number_of_edges()}"
+        f"[Projected] {out_name} via {by_col}: "
+        f"|V|={G.number_of_nodes()}, |E|={G.number_of_edges()}"
     )
 
+    # save as before (gpickle + parquet)
     gpath = PROJ_DIR / f"{out_name}.gpickle"
     with open(gpath, "wb") as f:
         pickle.dump(G, f)
@@ -379,7 +393,6 @@ def build_projected_graph(df_meta: pd.DataFrame, by_col: str, out_name: str) -> 
     pd.DataFrame(nodes).to_parquet(PROJ_DIR / f"{out_name}_nodes.parquet", index=False)
 
     return G
-
 
 def build_all_projected_graphs(df_meta: pd.DataFrame):
     build_projected_graph(df_meta, "group", "product_graph_same_group")
