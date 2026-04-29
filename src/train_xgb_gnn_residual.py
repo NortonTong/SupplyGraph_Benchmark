@@ -17,7 +17,6 @@ from build_graphs import (
     build_homo5type_from_parquet,
     build_hetero5type_from_parquet,
     make_homo5_flat_edge_index,
-    HORIZON,
 )
 
 from models_gnn import (
@@ -38,6 +37,7 @@ def plot_baseline6_predictions_per_product(
     out_dir: Path,
     temporal_type: str,
     lag_window: int,
+    horizon: int,          # <-- thêm
     graph_type: str,
     mode_name: str,
     edge_view: str | None = None,
@@ -81,7 +81,7 @@ def plot_baseline6_predictions_per_product(
         title = f"Baseline 6 - {graph_type}"
         if edge_view is not None:
             title += f" ({edge_view})"
-        title += f" [{mode_name}] H{HORIZON}, lag={lag_window}, {temporal_type} - node_id={node}"
+        title += f" [{mode_name}] H{horizon}, lag={lag_window}, {temporal_type} - node_id={node}"
 
         plt.title(title)
         plt.xlabel("Date")
@@ -92,7 +92,7 @@ def plot_baseline6_predictions_per_product(
         # tên file
         ev = edge_view if edge_view is not None else "noedgeview"
         fname = out_dir / (
-            f"baseline6_{graph_type}_{ev}_h{HORIZON}_lag{lag_window}_{temporal_type}_{mode_name}_node_{node}.png"
+            f"baseline6_{graph_type}_{ev}_h{horizon}_lag{lag_window}_{temporal_type}_{mode_name}_node_{node}.png"
         )
         plt.savefig(fname, dpi=150)
         plt.close()
@@ -188,6 +188,7 @@ def get_time_splits(days: np.ndarray, split) -> Tuple[List[int], List[int], List
 def train_residual_projected(
     temporal_type: str,
     lag_window: int,
+    horizon: int,
     edge_view: str,
     is_log1p: bool,
     device: str = "cuda",
@@ -201,17 +202,17 @@ def train_residual_projected(
     mode_name = "log1p" if is_log1p else "raw"
     print(
         f"\n=== Baseline 6: Residual Projected GNN "
-        f"[H{HORIZON}][lag{lag_window}][{temporal_type}][view={edge_view}][{mode_name}] ==="
+        f"[H{horizon}][lag{lag_window}][{temporal_type}][view={edge_view}][{mode_name}] ==="
     )
 
     df_meta = load_node_metadata()
-    df_xgb = load_xgb_tabular_for_gnn(temporal_type, lag_window, HORIZON)
+    df_xgb = load_xgb_tabular_for_gnn(temporal_type, lag_window, horizon)
 
     pred_path = (
         PROC_DIR
         / "baseline"
         / "xgboost"
-        / f"xgboost_predictions_h{HORIZON}_lag{lag_window}_{temporal_type}.parquet"
+        / f"xgboost_predictions_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     )
     print(f"[RESID-PROJ] Loading XGBoost predictions from {pred_path}")
     df_pred = pd.read_parquet(pred_path)
@@ -353,7 +354,7 @@ def train_residual_projected(
     mape_test = mape(y_test_true_flat, y_test_pred_flat)
     smape_test = smape(y_test_true_flat, y_test_pred_flat)
 
-    tag = f"baseline6_residual_proj_{edge_view}_h{HORIZON}_lag{lag_window}_{temporal_type}_{mode_name}"
+    tag = f"baseline6_residual_proj_{edge_view}_h{horizon}_lag{lag_window}_{temporal_type}_{mode_name}"
 
     print(f"\n[Residual-Proj-{edge_view}][{tag}] Train:")
     print(f"  MAE  : {mae_train:.4f}")
@@ -398,6 +399,7 @@ def train_residual_projected(
         out_dir=out_plot_dir,
         temporal_type=temporal_type,
         lag_window=lag_window,
+        horizon = horizon,
         graph_type=f"projected_{edge_view}",
         mode_name=mode_name,
         edge_view=edge_view,
@@ -408,7 +410,7 @@ def train_residual_projected(
         {
             "temporal_type": temporal_type,
             "lag_window": lag_window,
-            "horizon": HORIZON,
+            "horizon": horizon,
             "graph_type": "projected",
             "edge_view": edge_view,
             "variant": "baseline_6_residual",
@@ -433,6 +435,7 @@ def train_residual_projected(
 def train_residual_homo5(
     temporal_type: str,
     lag_window: int,
+    horizon: int,   
     is_log1p: bool,
     device: str = "cuda",
     epochs: int = 400,
@@ -445,17 +448,17 @@ def train_residual_homo5(
     mode_name = "log1p" if is_log1p else "raw"
     print(
         f"\n=== Baseline 6: Residual Homo5 GNN "
-        f"[H{HORIZON}][lag{lag_window}][{temporal_type}][{mode_name}] ==="
+        f"[H{horizon}][lag{lag_window}][{temporal_type}][{mode_name}] ==="
     )
 
     df_meta = load_node_metadata()
-    df_xgb = load_xgb_tabular_for_gnn(temporal_type, lag_window, HORIZON)
+    df_xgb = load_xgb_tabular_for_gnn(temporal_type, lag_window, horizon)
 
     pred_path = (
         PROC_DIR
         / "baseline"
         / "xgboost"
-        / f"xgboost_predictions_h{HORIZON}_lag{lag_window}_{temporal_type}.parquet"
+        / f"xgboost_predictions_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     )
     print(f"[RESID-HOMO5] Loading XGBoost predictions from {pred_path}")
     df_pred = pd.read_parquet(pred_path)
@@ -646,7 +649,7 @@ def train_residual_homo5(
     mape_test = mape(y_test_true_flat, y_test_pred_flat)
     smape_test = smape(y_test_true_flat, y_test_pred_flat)
 
-    tag = f"baseline6_residual_homo5_h{HORIZON}_lag{lag_window}_{temporal_type}_{mode_name}"
+    tag = f"baseline6_residual_homo5_h{horizon}_lag{lag_window}_{temporal_type}_{mode_name}"
 
     print(f"\n[Residual-Homo5][{tag}] Train:")
     print(f"  MAE  : {mae_train:.4f}")
@@ -691,6 +694,7 @@ def train_residual_homo5(
         out_dir=out_plot_dir,
         temporal_type=temporal_type,
         lag_window=lag_window,
+        horizon = horizon,
         graph_type="homo5",
         mode_name=mode_name,
         edge_view=None,
@@ -700,7 +704,7 @@ def train_residual_homo5(
         {
             "temporal_type": temporal_type,
             "lag_window": lag_window,
-            "horizon": HORIZON,
+            "horizon": horizon,
             "graph_type": "homo5",
             "edge_view": None,
             "variant": "baseline_6_residual",
@@ -731,23 +735,24 @@ def train_residual_hetero5(
     batch_days: int = 8,
     es_patience: int = 20,
     es_min_delta: float = 0.001,
+    horizon: int = 5,
 ):
     global RUN_SUMMARY
 
     mode_name = "log1p" if is_log1p else "raw"
     print(
         f"\n=== Baseline 6: Residual Hetero5 GNN "
-        f"[H{HORIZON}][lag{lag_window}][{temporal_type}][{mode_name}] ==="
+        f"[H{horizon}][lag{lag_window}][{temporal_type}][{mode_name}] ==="
     )
 
     df_meta = load_node_metadata()
-    df_xgb = load_xgb_tabular_for_gnn(temporal_type, lag_window, HORIZON)
+    df_xgb = load_xgb_tabular_for_gnn(temporal_type, lag_window, horizon)
 
     pred_path = (
         PROC_DIR
         / "baseline"
         / "xgboost"
-        / f"xgboost_predictions_h{HORIZON}_lag{lag_window}_{temporal_type}.parquet"
+        / f"xgboost_predictions_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     )
     print(f"[RESID-HET5] Loading XGBoost predictions from {pred_path}")
     df_pred = pd.read_parquet(pred_path)
@@ -927,7 +932,7 @@ def train_residual_hetero5(
     mape_test = mape(y_test_true_flat, y_test_pred_flat)
     smape_test = smape(y_test_true_flat, y_test_pred_flat)
 
-    tag = f"baseline6_residual_hetero5_h{HORIZON}_lag{lag_window}_{temporal_type}_{mode_name}"
+    tag = f"baseline6_residual_hetero5_h{horizon}_lag{lag_window}_{temporal_type}_{mode_name}"
 
     print(f"\n[Residual-Hetero5][{tag}] Train:")
     print(f"  MAE  : {mae_train:.4f}")
@@ -972,6 +977,7 @@ def train_residual_hetero5(
         out_dir=out_plot_dir,
         temporal_type=temporal_type,
         lag_window=lag_window,
+        horizon = horizon,
         graph_type="hetero5",
         mode_name=mode_name,
         edge_view=None,
@@ -981,7 +987,7 @@ def train_residual_hetero5(
         {
             "temporal_type": temporal_type,
             "lag_window": lag_window,
-            "horizon": HORIZON,
+            "horizon": horizon,
             "graph_type": "hetero5",
             "edge_view": None,
             "variant": "baseline_6_residual",
@@ -1021,42 +1027,46 @@ def main():
         modes: list[bool] = []
         if exp.is_log1p:
             modes.append(True)
-        # luôn thêm raw
-        modes.append(False)
+        modes.append(False)  # luôn thêm raw
 
-        for lag_window in exp.lag_windows:
-            for is_log1p in modes:
-                if only_graph in ["all", "projected"]:
-                    for view in PROJECTED_VIEWS:
-                        train_residual_projected(
+        for horizon in exp.horizons:               # <-- thêm loop horizon
+            for lag_window in exp.lag_windows:
+                for is_log1p in modes:
+                    if only_graph in ["all", "projected"]:
+                        for view in PROJECTED_VIEWS:
+                            train_residual_projected(
+                                temporal_type=temporal_type,
+                                lag_window=lag_window,
+                                horizon=horizon,         # <-- truyền thêm
+                                edge_view=view,
+                                is_log1p=is_log1p,
+                                device=device,
+                                epochs=epochs,
+                                batch_days=batch_days,
+                            )
+
+                    if only_graph in ["all", "homo5"]:
+                        train_residual_homo5(
                             temporal_type=temporal_type,
                             lag_window=lag_window,
-                            edge_view=view,
+                            horizon=horizon,             # <-- truyền thêm
                             is_log1p=is_log1p,
                             device=device,
                             epochs=epochs,
                             batch_days=batch_days,
                         )
 
-                if only_graph in ["all", "homo5"]:
-                    train_residual_homo5(
-                        temporal_type=temporal_type,
-                        lag_window=lag_window,
-                        is_log1p=is_log1p,
-                        device=device,
-                        epochs=epochs,
-                        batch_days=batch_days,
-                    )
+                    if only_graph in ["all", "hetero5"]:
+                        train_residual_hetero5(
+                            temporal_type=temporal_type,
+                            lag_window=lag_window,
+                            horizon=horizon,             # <-- truyền thêm
+                            is_log1p=is_log1p,
+                            device=device,
+                            epochs=epochs,
+                            batch_days=batch_days,
+                        )
 
-                if only_graph in ["all", "hetero5"]:
-                    train_residual_hetero5(
-                        temporal_type=temporal_type,
-                        lag_window=lag_window,
-                        is_log1p=is_log1p,
-                        device=device,
-                        epochs=epochs,
-                        batch_days=batch_days,
-                    )
 
     # ====== Summary CSV ======
     if RUN_SUMMARY:

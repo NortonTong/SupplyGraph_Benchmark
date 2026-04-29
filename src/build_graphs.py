@@ -44,7 +44,6 @@ EDGE_TYPE_PRODUCT_SUBGROUP = "product_subgroup"
 EDGE_TYPE_PRODUCT_PLANT = "product_plant"
 EDGE_TYPE_PRODUCT_STORAGE = "product_storage"
 
-HORIZON = 7
 
 
 def load_node_metadata() -> pd.DataFrame:
@@ -79,45 +78,46 @@ def load_node_metadata() -> pd.DataFrame:
 
 def sanity_check_alignment(df_meta: pd.DataFrame):
     temporal_types = sorted({exp.temporal_type for exp in DEFAULT_EXPERIMENTS})
+    horizons = sorted({h for exp in DEFAULT_EXPERIMENTS for h in exp.horizons})
 
     for temporal_type in temporal_types:
-        raw_path = PROC_DIR / "base" / f"base_raw_h{HORIZON}_{temporal_type}.parquet"
-        if not raw_path.exists():
-            print(f"[SanityCheck] {raw_path} not found, skip.")
-            continue
+        for H in horizons:
+            raw_path = PROC_DIR / "base" / f"base_raw_h{H}_{temporal_type}.parquet"
+            if not raw_path.exists():
+                print(f"[SanityCheck] {raw_path} not found, skip.")
+                continue
 
-        df_ts = pd.read_parquet(raw_path)
-        df_ts_idx = (
-            df_ts[["node_id", "node_index"]]
-            .drop_duplicates()
-            .sort_values("node_index")
-            .reset_index(drop=True)
-        )
-        df_meta_idx = (
-            df_meta[["node_id", "node_index"]]
-            .drop_duplicates()
-            .sort_values("node_index")
-            .reset_index(drop=True)
-        )
-
-        if len(df_ts_idx) != len(df_meta_idx):
-            print(
-                f"[SanityCheck][{temporal_type}] WARNING: "
-                f"#nodes in timeseries ({len(df_ts_idx)}) != #nodes in meta ({len(df_meta_idx)})"
+            df_ts = pd.read_parquet(raw_path)
+            df_ts_idx = (
+                df_ts[["node_id", "node_index"]]
+                .drop_duplicates()
+                .sort_values("node_index")
+                .reset_index(drop=True)
+            )
+            df_meta_idx = (
+                df_meta[["node_id", "node_index"]]
+                .drop_duplicates()
+                .sort_values("node_index")
+                .reset_index(drop=True)
             )
 
-        merged = df_ts_idx.merge(df_meta_idx, on=["node_id", "node_index"], how="inner")
-        if len(merged) != len(df_ts_idx):
-            print(
-                f"[SanityCheck][{temporal_type}] WARNING: "
-                f"{len(df_ts_idx) - len(merged)} nodes mismatch between timeseries and meta."
-            )
-        else:
-            print(
-                f"[SanityCheck][{temporal_type}] OK: "
-                f"product node_id/node_index aligned ({len(merged)} nodes)."
-            )
+            if len(df_ts_idx) != len(df_meta_idx):
+                print(
+                    f"[SanityCheck][{temporal_type}][H={H}] WARNING: "
+                    f"#nodes in timeseries ({len(df_ts_idx)}) != #nodes in meta ({len(df_meta_idx)})"
+                )
 
+            merged = df_ts_idx.merge(df_meta_idx, on=["node_id", "node_index"], how="inner")
+            if len(merged) != len(df_ts_idx):
+                print(
+                    f"[SanityCheck][{temporal_type}][H={H}] WARNING: "
+                    f"{len(df_ts_idx) - len(merged)} nodes mismatch between timeseries and meta."
+                )
+            else:
+                print(
+                    f"[SanityCheck][{temporal_type}][H={H}] OK: "
+                    f"product node_id/node_index aligned ({len(merged)} nodes)."
+                )
 
 def build_homogeneous_5type_graph(df_meta: pd.DataFrame) -> nx.Graph:
     G = nx.Graph()
@@ -418,7 +418,7 @@ def is_graph_side_ohe(col: str) -> bool:
 def load_xgb_tabular_for_gnn(
     temporal_type: str,
     lag_window: int,
-    horizon: int = HORIZON,
+    horizon: int ,
 ) -> pd.DataFrame:
     path = XGB_BASE_DIR / f"xgboost_tabular_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     print(f"[GNN-DATA] Loading XGBoost tabular from {path}")
@@ -832,27 +832,38 @@ def make_homo5_flat_edge_index(
     return edge_index_flat
 
 
-def build_gnn_datasets_for_config(temporal_type: str, lag_window: int, df_meta: pd.DataFrame):
+def build_gnn_datasets_for_config(
+    temporal_type: str,
+    lag_window: int,
+    horizon: int,
+    df_meta: pd.DataFrame,
+):
     print(
         f"\n=== Build GNN datasets (projected/homo5/hetero5) "
-        f"from tabular: temporal_type={temporal_type}, lag_window={lag_window} ==="
+        f"from tabular: temporal_type={temporal_type}, "
+        f"horizon={horizon}, lag_window={lag_window} ==="
     )
 
-    df_xgb = load_xgb_tabular_for_gnn(temporal_type, lag_window, HORIZON)
+    # 1) Load XGBoost tabular (no graph) cho horizon tương ứng
+    df_xgb = load_xgb_tabular_for_gnn(
+        temporal_type=temporal_type,
+        lag_window=lag_window,
+        horizon=horizon,
+    )
     pkg_common, nodeindex2pos_prod = build_time_tensors_from_xgb_for_gnn(df_xgb)
 
-    # 1) Projected product graph (4 view)
+    # 2) Projected product graph (4 view)
     edge_index_proj = build_projected_edge_indices(nodeindex2pos_prod, df_meta)
     pkg_proj = {
         **pkg_common,
         "edge_index_dict": edge_index_proj,
         "graph_def": "projected_product_4view",
     }
-    out_proj = GNN_DIR / f"gnn_projected_h{HORIZON}_lag{lag_window}_{temporal_type}.pt"
+    out_proj = GNN_DIR / f"gnn_projected_h{horizon}_lag{lag_window}_{temporal_type}.pt"
     torch.save(pkg_proj, out_proj)
     print(f"[GNN-SAVE] projected dataset -> {out_proj}")
 
-    # 2) Homogeneous 5-type
+    # 3) Homogeneous 5-type
     edge_index_homo5, num_nodes_homo5, nodes_homo_tbl = build_homo5type_from_parquet()
 
     node_type_order = sorted(nodes_homo_tbl["node_type"].unique().tolist())
@@ -870,11 +881,11 @@ def build_gnn_datasets_for_config(temporal_type: str, lag_window: int, df_meta: 
         "nodes_homo_table": nodes_homo_tbl,
         "graph_def": "homogeneous_5node_types",
     }
-    out_homo5 = GNN_DIR / f"gnn_homo5_h{HORIZON}_lag{lag_window}_{temporal_type}.pt"
+    out_homo5 = GNN_DIR / f"gnn_homo5_h{horizon}_lag{lag_window}_{temporal_type}.pt"
     torch.save(pkg_homo5, out_homo5)
     print(f"[GNN-SAVE] homo5 dataset -> {out_homo5}")
 
-    # 3) Heterogeneous 5-type
+    # 4) Heterogeneous 5-type
     edge_index_het5, num_nodes_het5, nodes_het_tbl = build_hetero5type_from_parquet()
     pkg_het5 = {
         **pkg_common,
@@ -883,10 +894,9 @@ def build_gnn_datasets_for_config(temporal_type: str, lag_window: int, df_meta: 
         "nodes_hetero_table": nodes_het_tbl,
         "graph_def": "heterogeneous_5node_types",
     }
-    out_het5 = GNN_DIR / f"gnn_hetero5_h{HORIZON}_lag{lag_window}_{temporal_type}.pt"
+    out_het5 = GNN_DIR / f"gnn_hetero5_h{horizon}_lag{lag_window}_{temporal_type}.pt"
     torch.save(pkg_het5, out_het5)
     print(f"[GNN-SAVE] hetero5 dataset -> {out_het5}")
-
 
 def compute_projected_graph_features(df_meta: pd.DataFrame) -> pd.DataFrame:
     def degree_and_basic_stats(G: nx.Graph, suffix: str) -> pd.DataFrame:
@@ -1120,24 +1130,32 @@ def main():
     df_meta = load_node_metadata()
     sanity_check_alignment(df_meta)
 
+    # build graph structure (không phụ thuộc horizon)
     build_homogeneous_5type_graph(df_meta)
     build_heterogeneous_5type_graph(df_meta)
     build_all_projected_graphs(df_meta)
 
+    # cho mọi cấu hình trong DEFAULT_EXPERIMENTS
     for exp in DEFAULT_EXPERIMENTS:
         t_type = exp.temporal_type
         for H in exp.horizons:
-            if H != HORIZON:
-                print(
-                    f"[WARN] Experiment horizon={H} != HORIZON={HORIZON} in build_graphs.py. "
-                    f"Using HORIZON={HORIZON} for GNN datasets."
-                )
             for L in exp.lag_windows:
-                build_gnn_datasets_for_config(t_type, L, df_meta)
-                build_xgb_graph_baselines_for_config(t_type, H, L, df_meta)
+                # GNN datasets cho horizon H
+                build_gnn_datasets_for_config(
+                    temporal_type=t_type,
+                    lag_window=L,
+                    horizon=H,
+                    df_meta=df_meta,
+                )
+                # XGB + graph baselines cho horizon H
+                build_xgb_graph_baselines_for_config(
+                    temporal_type=t_type,
+                    horizon=H,
+                    lag_window=L,
+                    df_meta=df_meta,
+                )
 
     print("\n[build_graphs] Done building graphs + GNN datasets + XGB graph baselines.")
-
 
 if __name__ == "__main__":
     main()

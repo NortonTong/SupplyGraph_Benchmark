@@ -352,29 +352,34 @@ def main():
 
     for exp in DEFAULT_EXPERIMENTS:
         temporal_type = exp.temporal_type
-        # theo code baseline của bạn: HORIZON = list(exp.horizons)[0]
         horizons = list(exp.horizons)
         if not horizons:
             continue
-        horizon = horizons[0]
 
-        lag_windows = list(exp.gru_seq_lengths)  # cùng cách lấy LAG_WINDOWS như bạn
+        # nên lấy lag_windows giống các script khác: exp.lag_windows
+        # nếu bạn cố ý dùng gru_seq_lengths ở đây thì giữ nguyên
+        lag_windows = list(getattr(exp, "lag_windows", exp.gru_seq_lengths))
 
-        print(f"\n====== EXP: temporal_type={temporal_type}, H={horizon}, lags={lag_windows} ======")
+        print(
+            f"\n====== EXP: temporal_type={temporal_type}, "
+            f"H={horizons}, lags={lag_windows} ======"
+        )
 
-        for lag_window in lag_windows:
-            for gtype in graph_types:
-                try:
-                    train_xgb_tabular_graphfeat(
-                        horizon=horizon,
-                        temporal_type=temporal_type,
-                        lag_window=lag_window,
-                        graph_type=gtype,
-                    )
-                except FileNotFoundError:
-                    print(
-                        f"[WARN] File for {gtype}, H{horizon}, lag{lag_window}, {temporal_type} không tồn tại, skip."
-                    )
+        for horizon in horizons:              # <-- loop tất cả horizon
+            for lag_window in lag_windows:
+                for gtype in graph_types:
+                    try:
+                        train_xgb_tabular_graphfeat(
+                            horizon=horizon,
+                            temporal_type=temporal_type,
+                            lag_window=lag_window,
+                            graph_type=gtype,
+                        )
+                    except FileNotFoundError:
+                        print(
+                            f"[WARN] File for {gtype}, H{horizon}, "
+                            f"lag{lag_window}, {temporal_type} không tồn tại, skip."
+                        )
 
     if RUN_SUMMARY:
         df_sum = pd.DataFrame(RUN_SUMMARY)
@@ -409,7 +414,6 @@ def main():
         out_path.parent.mkdir(parents=True, exist_ok=True)
         df_sum.to_csv(out_path, index=False)
         print(f"\nSaved XGB + graph features summary to {out_path}")
-
 
 if __name__ == "__main__":
     main()

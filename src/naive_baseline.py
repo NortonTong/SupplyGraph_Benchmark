@@ -51,7 +51,11 @@ def save_and_eval_naive_last_t0(
     Tính MAE, RMSE, MAPE, sMAPE cho naive_last_t0 và lưu CSV:
       columns: node_id, date, day, y_true, y_pred
     """
-    y_true = df_test["y_h7"].values   # label trong base_full
+    target_col = f"y_h{horizon}"
+    if target_col not in df_test.columns:
+        raise ValueError(f"Expected '{target_col}' column in FULL baseline dataset.")
+
+    y_true = df_test[target_col].values
     y_pred = df_test["y_pred_last_t0"].values
 
     mae = mean_absolute_error(y_true, y_pred)
@@ -68,11 +72,10 @@ def save_and_eval_naive_last_t0(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"naive_last_t0_h{horizon}_test_predictions.csv"
 
-    out_df = df_test[["node_id", "date", "day", "y_h7", "y_pred_last_t0"]].copy()
-    out_df = out_df.rename(columns={"y_h7": "y_true", "y_pred_last_t0": "y_pred"})
+    out_df = df_test[["node_id", "date", "day", target_col, "y_pred_last_t0"]].copy()
+    out_df = out_df.rename(columns={target_col: "y_true", "y_pred_last_t0": "y_pred"})
     out_df.to_csv(out_path, index=False)
 
-    # append vào RUN_SUMMARY
     RUN_SUMMARY.append(
         {
             "temporal_type": temporal_type,
@@ -95,14 +98,9 @@ def save_and_eval_naive_last_t0(
 
     return mae, rmse, mape_val, smape_val, out_path
 
-
 def eval_naive_last_at_t0(horizon: int, lag_window: int, temporal_type: str = "unit"):
     """
     Naive: y_hat(t0+H) = last value tại t0.
-    Với pipeline hiện tại:
-    - base_full có cột sales_order là demand tại t0.
-    - Label y_h7 = sales_order tại t0+7.
-    => dùng 'sales_order' làm y_pred_last_t0.
     """
     df = load_baseline_dataset(horizon, lag_window, temporal_type)
     df = df.sort_values(["node_id", "day"]).reset_index(drop=True)
@@ -110,14 +108,18 @@ def eval_naive_last_at_t0(horizon: int, lag_window: int, temporal_type: str = "u
     if "sales_order" not in df.columns:
         raise ValueError("Expected 'sales_order' column in FULL baseline dataset.")
 
+    target_col = f"y_h{horizon}"
+    if target_col not in df.columns:
+        raise ValueError(f"Expected '{target_col}' column in FULL baseline dataset.")
+
     df["last_value_t0"] = df["sales_order"]
 
     df_test = df[df["split"] == "test"].copy()
     df_train = df[df["split"] == "train"].copy()
 
     # fallback nếu thiếu sales_order
-    mean_per_node = df_train.groupby("node_id")["y_h7"].mean()
-    global_mean = df_train["y_h7"].mean()
+    mean_per_node = df_train.groupby("node_id")[target_col].mean()
+    global_mean = df_train[target_col].mean()
 
     df_test = df_test.merge(
         mean_per_node.rename("train_mean_node"),
@@ -131,18 +133,20 @@ def eval_naive_last_at_t0(horizon: int, lag_window: int, temporal_type: str = "u
 
     return save_and_eval_naive_last_t0(df_test, horizon, lag_window, temporal_type)
 
+from config.config import PROC_DIR, DEFAULT_EXPERIMENTS
 
 def run_naive_last_t0():
     global RUN_SUMMARY
     RUN_SUMMARY = []
 
-    horizons = [7]
-    lag_windows = [7, 14]
-    temporal_types = ["unit"]
+    # Lấy toàn bộ cấu hình từ DEFAULT_EXPERIMENTS
+    temporal_types = sorted({exp.temporal_type for exp in DEFAULT_EXPERIMENTS})
+    horizons = sorted({h for exp in DEFAULT_EXPERIMENTS for h in exp.horizons})
+    lag_windows = sorted({L for exp in DEFAULT_EXPERIMENTS for L in exp.lag_windows})
 
-    for h in horizons:
-        for lag_w in lag_windows:
-            for tt in temporal_types:
+    for tt in temporal_types:
+        for h in horizons:
+            for lag_w in lag_windows:
                 print("\n==============================")
                 print(f"Naive LAST at t0 for H{h}, lag{lag_w}, {tt}")
                 print("==============================")
@@ -159,6 +163,9 @@ def run_naive_last_t0():
         print(f"\nSaved naive_last_t0 summary to {out_path}")
         print(df_sum)
 
+
+if __name__ == "__main__":
+    run_naive_last_t0()
 
 if __name__ == "__main__":
     run_naive_last_t0()

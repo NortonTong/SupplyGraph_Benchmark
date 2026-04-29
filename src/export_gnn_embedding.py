@@ -21,21 +21,17 @@ EMB_DIR.mkdir(parents=True, exist_ok=True)
 XGB_GNN_EMBED_DIR = PROC_DIR / "baseline" / "xgb_gnn_embed"
 XGB_GNN_EMBED_DIR.mkdir(parents=True, exist_ok=True)
 
-HORIZON = 7
-
-
 def get_experiment_params():
     temporal_types = sorted({exp.temporal_type for exp in DEFAULT_EXPERIMENTS})
     horizons = sorted({h for exp in DEFAULT_EXPERIMENTS for h in exp.horizons})
     lag_windows = sorted({L for exp in DEFAULT_EXPERIMENTS for L in exp.lag_windows})
-    if len(horizons) != 1:
-        raise ValueError(
-            f"[export_gnn_embeddings] Expected a single horizon, got {horizons}"
-        )
-    return temporal_types, horizons[0], lag_windows
+    # Không còn ép chỉ 1 horizon
+    return temporal_types, horizons, lag_windows
 
 
-TEMPORAL_TYPES, H, LAG_WINDOWS = get_experiment_params()
+TEMPORAL_TYPES, HORIZONS, LAG_WINDOWS = get_experiment_params()
+
+
 
 
 # ============================================================
@@ -48,21 +44,20 @@ PROJECTED_VIEWS = ["same_group", "same_subgroup", "same_plant", "same_storage"]
 def export_projected_embeddings_for_config(
     temporal_type: str,
     lag_window: int,
+    horizon: int,           # <-- thêm
     device: str = "cuda",
 ) -> None:
     """
-    Đọc gnn_projected_h{H}_lag{L}_{temporal_type}.pt
-    → với mỗi view trong PROJECTED_VIEWS, chạy encoder, lưu embedding dạng long:
-      (day, node_index_pos, split, view, emb_0..d-1)
+    Đọc gnn_projected_h{horizon}_lag{L}_{temporal_type}.pt
+    → với mỗi view trong PROJECTED_VIEWS, chạy encoder, lưu embedding dạng long.
     """
-    pkg_path = GNN_DIR / f"gnn_projected_h{H}_lag{lag_window}_{temporal_type}.pt"
+    pkg_path = GNN_DIR / f"gnn_projected_h{horizon}_lag{lag_window}_{temporal_type}.pt"
     if not pkg_path.exists():
         print(f"[EXPORT-PROJ] {pkg_path} not found, skip.")
         return
 
     print(f"[EXPORT-PROJ] Loading package from {pkg_path}")
-    pkg = torch.load(pkg_path, map_location=device, weights_only = False)
-
+    pkg = torch.load(pkg_path, map_location=device, weights_only=False)
     X_product = pkg["X_product"]          # [T, N_prod, F_in]
     days = pkg["days"]                    # tensor [T]
     split = pkg["split"]                  # list[str]
@@ -119,7 +114,7 @@ def export_projected_embeddings_for_config(
     df_emb = pd.DataFrame(rows)
     out_path = (
         EMB_DIR
-        / f"gnn_projected_emb_4views_h{H}_lag{lag_window}_{temporal_type}.parquet"
+        / f"gnn_projected_emb_4views_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df_emb.to_parquet(out_path, index=False)
@@ -128,20 +123,20 @@ def export_projected_embeddings_for_config(
 def export_homo5_embeddings_for_config(
     temporal_type: str,
     lag_window: int,
+    horizon: int,           # <-- thêm
     device: str = "cuda",
 ) -> None:
     """
-    Đọc gnn_homo5_h{H}_lag{L}_{temporal_type}.pt
-    → chạy HomogeneousFiveTypeGINEncoder với edge_index flatten (pkg['edge_index']).
+    Đọc gnn_homo5_h{horizon}_lag{L}_{temporal_type}.pt
+    → chạy HomogeneousFiveTypeGINEncoder ...
     """
-    pkg_path = GNN_DIR / f"gnn_homo5_h{H}_lag{lag_window}_{temporal_type}.pt"
+    pkg_path = GNN_DIR / f"gnn_homo5_h{horizon}_lag{lag_window}_{temporal_type}.pt"
     if not pkg_path.exists():
         print(f"[EXPORT-HOMO5] {pkg_path} not found, skip.")
         return
 
     print(f"[EXPORT-HOMO5] Loading package from {pkg_path}")
-    pkg = torch.load(pkg_path, map_location=device, weights_only = False)
-
+    pkg = torch.load(pkg_path, map_location=device, weights_only=False)
     if "edge_index" not in pkg:
         print(
             "[EXPORT-HOMO5] pkg['edge_index'] not found. "
@@ -213,20 +208,22 @@ def export_homo5_embeddings_for_config(
         return
 
     df_emb = pd.DataFrame(rows)
-    out_path = EMB_DIR / f"gnn_homo5_emb_h{H}_lag{lag_window}_{temporal_type}.parquet"
+    out_path = EMB_DIR / f"gnn_homo5_emb_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df_emb.to_parquet(out_path, index=False)
     print(f"[EXPORT-HOMO5] Saved homo5 embeddings to {out_path}")
+
 def export_hetero5_embeddings_for_config(
     temporal_type: str,
     lag_window: int,
+    horizon: int,           # <-- thêm
     device: str = "cuda",
 ) -> None:
     """
-    Đọc gnn_hetero5_h{H}_lag{L}_{temporal_type}.pt
+    Đọc gnn_hetero5_h{horizon}_lag{lag_window}_{temporal_type}.pt
     → chạy HeterogeneousGINEncoder → embedding cho product nodes.
     """
-    pkg_path = GNN_DIR / f"gnn_hetero5_h{H}_lag{lag_window}_{temporal_type}.pt"
+    pkg_path = GNN_DIR / f"gnn_hetero5_h{horizon}_lag{lag_window}_{temporal_type}.pt"
     if not pkg_path.exists():
         print(f"[EXPORT-HET5] {pkg_path} not found, skip.")
         return
@@ -292,7 +289,7 @@ def export_hetero5_embeddings_for_config(
                 )
 
     df_emb = pd.DataFrame(rows)
-    out_path = EMB_DIR / f"gnn_hetero5_emb_h{H}_lag{lag_window}_{temporal_type}.parquet"
+    out_path = EMB_DIR / f"gnn_hetero5_emb_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df_emb.to_parquet(out_path, index=False)
     print(f"[EXPORT-HET5] Saved hetero5 embeddings to {out_path}")
@@ -305,6 +302,7 @@ def export_hetero5_embeddings_for_config(
 def build_xgb_tabular_with_gnn_embed_projected(
     temporal_type: str,
     lag_window: int,
+    horizon: int,
 ):
     """
     base_full_{temporal_type}.parquet + 4-view projected embeddings
@@ -314,11 +312,11 @@ def build_xgb_tabular_with_gnn_embed_projected(
         PROC_DIR
         / "baseline"
         / "xgboost"
-        / f"xgboost_tabular_h{H}_lag{lag_window}_{temporal_type}.parquet"
+        / f"xgboost_tabular_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     )
     emb_path = (
         EMB_DIR
-        / f"gnn_projected_emb_4views_h{H}_lag{lag_window}_{temporal_type}.parquet"
+        / f"gnn_projected_emb_4views_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     )
 
     if not base_full_path.exists():
@@ -381,7 +379,7 @@ def build_xgb_tabular_with_gnn_embed_projected(
 
     out_path = (
         XGB_GNN_EMBED_DIR
-        / f"xgboost_tabular_gnnembed_projected4view_h{H}_lag{lag_window}_{temporal_type}.parquet"
+        / f"xgboost_tabular_gnnembed_projected4view_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df_out.to_parquet(out_path, index=False)
@@ -392,14 +390,16 @@ def build_xgb_tabular_with_gnn_embed_projected(
 def build_xgb_tabular_with_gnn_embed_homo5(
     temporal_type: str,
     lag_window: int,
+    horizon: int,           # <-- thêm
+
 ):
     base_full_path = (
         PROC_DIR
         / "baseline"
         / "xgboost"
-        / f"xgboost_tabular_h{H}_lag{lag_window}_{temporal_type}.parquet"
+        / f"xgboost_tabular_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     )
-    emb_path = EMB_DIR / f"gnn_homo5_emb_h{H}_lag{lag_window}_{temporal_type}.parquet"
+    emb_path = EMB_DIR / f"gnn_homo5_emb_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
 
     if not base_full_path.exists():
         print(f"[XGB-GNN-EMB-HOMO5] base_full not found: {base_full_path}, skip.")
@@ -436,7 +436,7 @@ def build_xgb_tabular_with_gnn_embed_homo5(
 
     out_path = (
         XGB_GNN_EMBED_DIR
-        / f"xgboost_tabular_gnnembed_homo5_h{H}_lag{lag_window}_{temporal_type}.parquet"
+        / f"xgboost_tabular_gnnembed_homo5_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df_out.to_parquet(out_path, index=False)
@@ -448,14 +448,15 @@ def build_xgb_tabular_with_gnn_embed_homo5(
 def build_xgb_tabular_with_gnn_embed_hetero5(
     temporal_type: str,
     lag_window: int,
+    horizon: int,           # <-- thêm
 ):
     base_full_path = (
         PROC_DIR
         / "baseline"
         / "xgboost"
-        / f"xgboost_tabular_h{H}_lag{lag_window}_{temporal_type}.parquet"
+        / f"xgboost_tabular_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     )
-    emb_path = EMB_DIR / f"gnn_hetero5_emb_h{H}_lag{lag_window}_{temporal_type}.parquet"
+    emb_path = EMB_DIR / f"gnn_hetero5_emb_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
 
     if not base_full_path.exists():
         print(f"[XGB-GNN-EMB-HET5] base_full not found: {base_full_path}, skip.")
@@ -492,7 +493,7 @@ def build_xgb_tabular_with_gnn_embed_hetero5(
 
     out_path = (
         XGB_GNN_EMBED_DIR
-        / f"xgboost_tabular_gnnembed_hetero5_h{H}_lag{lag_window}_{temporal_type}.parquet"
+        / f"xgboost_tabular_gnnembed_hetero5_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df_out.to_parquet(out_path, index=False)
@@ -509,46 +510,53 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     for temporal_type in TEMPORAL_TYPES:
-        for lag_window in LAG_WINDOWS:
-            print(
-                f"\n=== EXPORT GNN EMBEDDINGS + BUILD XGB DATASET "
-                f"H{H}, lag={lag_window}, temporal_type={temporal_type} ==="
-            )
+        for horizon in HORIZONS:              # <-- thêm loop horizon
+            for lag_window in LAG_WINDOWS:
+                print(
+                    f"\n=== EXPORT GNN EMBEDDINGS + BUILD XGB DATASET "
+                    f"H{horizon}, lag={lag_window}, temporal_type={temporal_type} ==="
+                )
 
-            # 1) Export embeddings cho 3 graph modes
-            export_projected_embeddings_for_config(
-                temporal_type=temporal_type,
-                lag_window=lag_window,
-                device=device,
-            )
-            export_homo5_embeddings_for_config(
-                temporal_type=temporal_type,
-                lag_window=lag_window,
-                device=device,
-            )
-            export_hetero5_embeddings_for_config(
-                temporal_type=temporal_type,
-                lag_window=lag_window,
-                device=device,
-            )
+                # 1) Export embeddings cho 3 graph modes
+                export_projected_embeddings_for_config(
+                    temporal_type=temporal_type,
+                    lag_window=lag_window,
+                    horizon=horizon,          # <-- truyền
+                    device=device,
+                )
+                export_homo5_embeddings_for_config(
+                    temporal_type=temporal_type,
+                    lag_window=lag_window,
+                    horizon=horizon,          # <-- truyền
+                    device=device,
+                )
+                export_hetero5_embeddings_for_config(
+                    temporal_type=temporal_type,
+                    lag_window=lag_window,
+                    horizon=horizon,          # <-- truyền
+                    device=device,
+                )
 
-            build_xgb_tabular_with_gnn_embed_projected(
-                temporal_type=temporal_type,
-                lag_window=lag_window,
-            )
-            build_xgb_tabular_with_gnn_embed_homo5(
-                temporal_type=temporal_type,
-                lag_window=lag_window,
-            )
-            build_xgb_tabular_with_gnn_embed_hetero5(
-                temporal_type=temporal_type,
-                lag_window=lag_window,
-            )
+                # 2) Build XGB tabular + embedding
+                build_xgb_tabular_with_gnn_embed_projected(
+                    temporal_type=temporal_type,
+                    lag_window=lag_window,
+                    horizon=horizon,          # <-- truyền
+                )
+                build_xgb_tabular_with_gnn_embed_homo5(
+                    temporal_type=temporal_type,
+                    lag_window=lag_window,
+                    horizon=horizon,          # <-- truyền
+                )
+                build_xgb_tabular_with_gnn_embed_hetero5(
+                    temporal_type=temporal_type,
+                    lag_window=lag_window,
+                    horizon=horizon,          # <-- truyền
+                )
 
     print(
         "\n[export_gnn_embeddings] Done exporting all embeddings and building all XGB datasets."
     )
-
 
 if __name__ == "__main__":
     main()

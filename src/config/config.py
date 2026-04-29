@@ -34,9 +34,9 @@ class ExperimentConfig:
 DEFAULT_EXPERIMENTS: list[ExperimentConfig] = [
     ExperimentConfig(
         temporal_type="unit",
-        horizons=[7],
-        lag_windows=[7, 14],
-        gru_seq_lengths=[7, 14],
+        horizons=[7,14,30],
+        lag_windows=[7, 14, 30],
+        gru_seq_lengths=[7, 14,30],
         is_softplus=False,
         is_log1p=False,
     ),

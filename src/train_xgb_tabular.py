@@ -9,10 +9,7 @@ from config.config import PROC_DIR, DEFAULT_EXPERIMENTS
 
 
 experiment = DEFAULT_EXPERIMENTS
-for exp in experiment:
-    TEMPORAL_TYPE = exp.temporal_type
-    HORIZON = list(exp.horizons)[0]
-    LAG_WINDOWS = list(exp.gru_seq_lengths)
+
 
 RUN_SUMMARY: list[dict] = []
 
@@ -44,21 +41,16 @@ def smape(y_true, y_pred, eps=1e-8):
 def load_tabular_baseline(
     temporal_type: str = "unit",
     lag_window: int = 7,
+    horizon: int = 7,
 ) -> pd.DataFrame:
-    """
-    Load file baseline XGBoost đã được preprocessing + OHE,
-    ví dụ:
-    data/processed/baseline/xgboost/xgboost_tabular_h{HORIZON}_lag{lag_window}_{temporal_type}.parquet
-    """
     path = (
         PROC_DIR
         / "baseline"
         / "xgboost"
-        / f"xgboost_tabular_h{HORIZON}_lag{lag_window}_{temporal_type}.parquet"
+        / f"xgboost_tabular_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     )
     print(f"Loading tabular baseline (no graph) from {path}")
     return pd.read_parquet(path)
-
 
 def split_train_val_test(df: pd.DataFrame):
     df_train = df[df["split"] == "train"].copy()
@@ -135,15 +127,16 @@ def plot_predictions_per_product(
 def train_xgb_tabular_baseline(
     temporal_type: str = "unit",
     lag_window: int = 7,
+    horizon: int = 7,
     tag: str | None = None,
 ) -> None:
     target_type = "raw"
     if tag is None:
-        tag = f"baseline1_xgb_tabular_{target_type}_lag{lag_window}_{temporal_type}"
+        tag = f"baseline1_xgb_tabular_{target_type}_h{horizon}_lag{lag_window}_{temporal_type}"
 
     print(
         f"\n=== Training XGBoost TABULAR baseline (Baseline 1) "
-        f"H{HORIZON}, lag={lag_window}, temporal_type={temporal_type}, "
+        f"H{horizon}, lag={lag_window}, temporal_type={temporal_type}, "
         f"target_type={target_type}, tag={tag} ==="
     )
 
@@ -151,7 +144,7 @@ def train_xgb_tabular_baseline(
     df_base = load_tabular_baseline(temporal_type=temporal_type, lag_window=lag_window)
 
     print(
-        f"H{HORIZON} tabular lag{lag_window} {temporal_type}: "
+        f"H{horizon} tabular lag{lag_window} {temporal_type}: "
         f"rows={len(df_base)}, unique(node,date)={df_base[['node_id','date']].drop_duplicates().shape[0]}"
     )
 
@@ -169,7 +162,7 @@ def train_xgb_tabular_baseline(
 
     feature_names = list(X_train.columns)
     print(
-        f"\n[H{HORIZON}][lag{lag_window}][{tag}] Using {len(feature_names)} features (tabular only):"
+        f"\n[H{horizon}][lag{lag_window}][{tag}] Using {len(feature_names)} features (tabular only):"
     )
     print(feature_names)
     print(f"Train samples: {X_train.shape[0]}")
@@ -212,7 +205,7 @@ def train_xgb_tabular_baseline(
     plt.xlabel("Boosting round")
     plt.ylabel("RMSE")
     plt.title(
-        f"Learning curve H{HORIZON} lag{lag_window} - {tag} - {temporal_type}"
+        f"Learning curve H{horizon} lag{lag_window} - {tag} - {temporal_type}"
     )
     plt.legend()
     plt.tight_layout()
@@ -222,7 +215,7 @@ def train_xgb_tabular_baseline(
         / "predictions"
         / "baseline_1"
         / "plots_learning_curves"
-        / f"learning_curve_h{HORIZON}_lag{lag_window}_{target_type}_{tag}_{temporal_type}.png"
+        / f"learning_curve_h{horizon}_lag{lag_window}_{target_type}_{tag}_{temporal_type}.png"
     )
     out_curve.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_curve, dpi=150)
@@ -258,19 +251,19 @@ def train_xgb_tabular_baseline(
     mape_test  = mape(y_test_true, y_test_pred)
     smape_test = smape(y_test_true, y_test_pred)
 
-    print(f"\n[H{HORIZON}][lag{lag_window}][tabular][{target_type}][{tag}] Train:")
+    print(f"\n[H{horizon}][lag{lag_window}][tabular][{target_type}][{tag}] Train:")
     print(f"  MAE   : {mae_train:.4f}")
     print(f"  RMSE  : {rmse_train:.4f}")
     print(f"  MAPE  : {mape_train:.4f}")
     print(f"  sMAPE : {smape_train:.4f}")
 
-    print(f"\n[H{HORIZON}][lag{lag_window}][tabular][{target_type}][{tag}] Val:")
+    print(f"\n[H{horizon}][lag{lag_window}][tabular][{target_type}][{tag}] Val:")
     print(f"  MAE   : {mae_val:.4f}")
     print(f"  RMSE  : {rmse_val:.4f}")
     print(f"  MAPE  : {mape_val:.4f}")
     print(f"  sMAPE : {smape_val:.4f}")
 
-    print(f"\n[H{HORIZON}][lag{lag_window}][tabular][{target_type}][{tag}] Test:")
+    print(f"\n[H{horizon}][lag{lag_window}][tabular][{target_type}][{tag}] Test:")
     print(f"  MAE   : {mae_test:.4f}")
     print(f"  RMSE  : {rmse_test:.4f}")
     print(f"  MAPE  : {mape_test:.4f}")
@@ -299,7 +292,7 @@ def train_xgb_tabular_baseline(
         PROC_DIR
         / "baseline"
         / "xgboost"
-        / f"xgboost_predictions_h{HORIZON}_lag{lag_window}_{temporal_type}.parquet"
+        / f"xgboost_predictions_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     )
     pred_path.parent.mkdir(parents=True, exist_ok=True)
     df_all_pred.to_parquet(pred_path, index=False)
@@ -308,7 +301,7 @@ def train_xgb_tabular_baseline(
     # 7) Save test predictions & plots per product (cho baseline 1 phân tích)
     base_pred_dir = PROC_DIR / "predictions" / "baseline_1"
     out_dir_csv = base_pred_dir / "csv" / f"{temporal_type}"
-    plot_folder = f"{target_type}_lag{lag_window}"
+    plot_folder = f"{target_type}_lag{lag_window}_h{horizon}"
     out_dir_plot = base_pred_dir / "plots_xgb_tabular" / plot_folder / f"{temporal_type}"
     out_dir_csv.mkdir(parents=True, exist_ok=True)
     out_dir_plot.mkdir(parents=True, exist_ok=True)
@@ -321,7 +314,7 @@ def train_xgb_tabular_baseline(
             "y_pred": y_test_pred,
         }
     )
-    out_pred_file = out_dir_csv / f"xgb_tabular_h{HORIZON}_lag{lag_window}_{target_type}_test_predictions_{temporal_type}.csv"
+    out_pred_file = out_dir_csv / f"xgb_tabular_h{horizon}_lag{lag_window}_{target_type}_test_predictions_{temporal_type}.csv"
     df_test_pred.to_csv(out_pred_file, index=False)
     print(f"\nSaved test predictions to {out_pred_file}")
 
@@ -340,7 +333,7 @@ def train_xgb_tabular_baseline(
         {
             "temporal_type": temporal_type,
             "lag_window": lag_window,
-            "horizon": HORIZON,
+            "horizon": horizon,
             "variant": f"baseline_1_xgb_tabular_{target_type}",
             "tag": tag,
             "target_type": target_type,
@@ -364,19 +357,23 @@ def train_xgb_tabular_baseline(
 # =========================
 # Main: run all configs
 # =========================
-
 def main():
     global RUN_SUMMARY
     RUN_SUMMARY = []
 
-    temporal_type = TEMPORAL_TYPE
+    for exp in DEFAULT_EXPERIMENTS:
+        temporal_type = exp.temporal_type
+        horizons = list(exp.horizons)
+        lag_windows = list(exp.lag_windows)  # dùng lag_windows, không phải gru_seq_lengths
 
-    for lag_window in LAG_WINDOWS:
-        train_xgb_tabular_baseline(
-            temporal_type=temporal_type,
-            lag_window=lag_window,
-            tag=f"baseline1_xgb_tabular_raw_lag{lag_window}_{temporal_type}",
-        )
+        for lag_window in lag_windows:
+            for horizon in horizons:
+                train_xgb_tabular_baseline(
+                    temporal_type=temporal_type,
+                    lag_window=lag_window,
+                    horizon=horizon,
+                    tag=f"baseline1_xgb_tabular_raw_h{horizon}_lag{lag_window}_{temporal_type}",
+                )
 
     if RUN_SUMMARY:
         df_sum = pd.DataFrame(RUN_SUMMARY)

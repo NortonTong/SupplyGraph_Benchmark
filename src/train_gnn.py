@@ -13,10 +13,8 @@ from models_gnn import (
 )
 from config.config import PROC_DIR, DEFAULT_EXPERIMENTS
 
-
 RUN_SUMMARY = []
 
-HORIZON = 7
 LAG_WINDOWS = [7, 14]
 PROJECTED_VIEWS = ["same_group", "same_subgroup", "same_plant", "same_storage"]
 
@@ -98,7 +96,7 @@ class EarlyStopping:
 # Helper chung
 # =========================
 
-def load_gnn_pkg(graph_type: str, temporal_type: str, lag_window: int, horizon: int = 7):
+def load_gnn_pkg(graph_type: str, temporal_type: str, lag_window: int, horizon: int):
     if graph_type == "projected":
         name = f"gnn_projected_h{horizon}_lag{lag_window}_{temporal_type}.pt"
     elif graph_type == "homo5":
@@ -112,7 +110,6 @@ def load_gnn_pkg(graph_type: str, temporal_type: str, lag_window: int, horizon: 
     print(f"[LOAD] {path}")
     pkg = torch.load(path, map_location="cpu", weights_only=False)
     return pkg
-
 
 def get_time_splits(days, split):
     idx_train = [t for t in range(len(days)) if split[t] == "train"]
@@ -209,6 +206,7 @@ def run_projected_gnn_baseline(
     pkg,
     temporal_type: str,
     lag_window: int,
+    horizon: int,              # <-- thêm
     edge_view: str,
     device: str = "cuda",
     epochs: int = 30,
@@ -228,7 +226,7 @@ def run_projected_gnn_baseline(
 
     print(
         f"\n=== Training Projected GNN Baseline "
-        f"[H{HORIZON}][lag{lag_window}][{temporal_type}][view={edge_view}] "
+        f"[H{horizon}][lag{lag_window}][{temporal_type}][view={edge_view}] "
         f"[mode={mode_name}] ==="
     )
 
@@ -352,7 +350,7 @@ def run_projected_gnn_baseline(
     mape_test = mape(y_test_true_flat, y_test_pred_flat)
     smape_test = smape(y_test_true_flat, y_test_pred_flat)
 
-    tag = f"gnn_projected_{edge_view}_h{HORIZON}_lag{lag_window}_{temporal_type}_{mode_name}"
+    tag = f"gnn_projected_{edge_view}_h{horizon}_lag{lag_window}_{temporal_type}_{mode_name}"
 
     print(f"\n[Projected-{edge_view}][{tag}] Train:")
     print(f"  MAE  : {mae_train:.4f}")
@@ -402,7 +400,7 @@ def run_projected_gnn_baseline(
         {
             "temporal_type": temporal_type,
             "lag_window": lag_window,
-            "horizon": HORIZON,
+            "horizon": horizon,
             "variant": "gnn_projected",
             "tag": tag,
             "edge_view": edge_view,
@@ -431,6 +429,7 @@ def run_homo5_gnn_baseline(
     pkg,
     temporal_type: str,
     lag_window: int,
+    horizon: int,              # <-- thêm
     device: str = "cuda",
     epochs: int = 30,
     batch_days: int = 8,
@@ -448,7 +447,7 @@ def run_homo5_gnn_baseline(
 
     print(
         f"\n=== Training Homogeneous-5type GNN Baseline "
-        f"[H{HORIZON}][lag{lag_window}][{temporal_type}] "
+        f"[H{horizon}][lag{lag_window}][{temporal_type}] "
         f"[mode={mode_name}] ==="
     )
 
@@ -590,7 +589,7 @@ def run_homo5_gnn_baseline(
     mape_test = mape(y_test_true_flat, y_test_pred_flat)
     smape_test = smape(y_test_true_flat, y_test_pred_flat)
 
-    tag = f"gnn_homo5_h{HORIZON}_lag{lag_window}_{temporal_type}_{mode_name}"
+    tag = f"gnn_homo5_h{horizon}_lag{lag_window}_{temporal_type}_{mode_name}"
 
     print(f"\n[Homo5][{tag}] Train:")
     print(f"  MAE  : {mae_train:.4f}")
@@ -640,7 +639,7 @@ def run_homo5_gnn_baseline(
         {
             "temporal_type": temporal_type,
             "lag_window": lag_window,
-            "horizon": HORIZON,
+            "horizon": horizon,
             "variant": "gnn_homo5",
             "tag": tag,
             "edge_view": None,
@@ -669,6 +668,7 @@ def run_hetero5_gnn_baseline(
     pkg,
     temporal_type: str,
     lag_window: int,
+    horizon: int,              # <-- thêm
     device: str = "cuda",
     epochs: int = 30,
     batch_days: int = 8,
@@ -686,7 +686,7 @@ def run_hetero5_gnn_baseline(
 
     print(
         f"\n=== Training Heterogeneous-5type GNN Baseline "
-        f"[H{HORIZON}][lag{lag_window}][{temporal_type}] "
+        f"[H{horizon}][lag{lag_window}][{temporal_type}] "
         f"[mode={mode_name}] ==="
     )
 
@@ -823,7 +823,7 @@ def run_hetero5_gnn_baseline(
     mape_test = mape(y_test_true_flat, y_test_pred_flat)
     smape_test = smape(y_test_true_flat, y_test_pred_flat)
 
-    tag = f"gnn_hetero5_h{HORIZON}_lag{lag_window}_{temporal_type}_{mode_name}"
+    tag = f"gnn_hetero5_h{horizon}_lag{lag_window}_{temporal_type}_{mode_name}"
 
     print(f"\n[Hetero5][{tag}] Train:")
     print(f"  MAE  : {mae_train:.4f}")
@@ -873,7 +873,7 @@ def run_hetero5_gnn_baseline(
         {
             "temporal_type": temporal_type,
             "lag_window": lag_window,
-            "horizon": HORIZON,
+            "horizon": horizon,
             "variant": "gnn_hetero5",
             "tag": tag,
             "edge_view": None,
@@ -919,17 +919,39 @@ def main():
 
         base_dir = Path(PROC_DIR) / "predictions" / "baseline_4" / f"{temporal_type}_{mode_name}"
 
-        for lag_window in exp.lag_windows:
-            print(f"\n############ GNN Baselines: temporal={temporal_type}, lag={lag_window} ############")
+        for horizon in exp.horizons:             # <-- loop tất cả H
+            for lag_window in exp.lag_windows:
+                print(
+                    f"\n############ GNN Baselines: temporal={temporal_type}, "
+                    f"H={horizon}, lag={lag_window} ############"
+                )
 
-            # 1) Projected
-            pkg_proj = load_gnn_pkg("projected", temporal_type, lag_window)
-            for view in PROJECTED_VIEWS:
-                run_projected_gnn_baseline(
-                    pkg=pkg_proj,
+                # 1) Projected
+                pkg_proj = load_gnn_pkg("projected", temporal_type, lag_window, horizon=horizon)
+                for view in PROJECTED_VIEWS:
+                    run_projected_gnn_baseline(
+                        pkg=pkg_proj,
+                        temporal_type=temporal_type,
+                        lag_window=lag_window,
+                        horizon=horizon,              # <-- truyền H
+                        edge_view=view,
+                        device="cuda",
+                        epochs=300,
+                        batch_days=8,
+                        es_patience=es_patience,
+                        es_min_delta=es_min_delta,
+                        is_softplus=is_sp,
+                        is_log1p=is_log1p,
+                        base_dir=base_dir,
+                    )
+
+                # 2) Homogeneous 5-type
+                pkg_homo5 = load_gnn_pkg("homo5", temporal_type, lag_window, horizon=horizon)
+                run_homo5_gnn_baseline(
+                    pkg=pkg_homo5,
                     temporal_type=temporal_type,
                     lag_window=lag_window,
-                    edge_view=view,
+                    horizon=horizon,                  # <-- truyền H
                     device="cuda",
                     epochs=300,
                     batch_days=8,
@@ -940,38 +962,24 @@ def main():
                     base_dir=base_dir,
                 )
 
-            # 2) Homogeneous 5-type
-            pkg_homo5 = load_gnn_pkg("homo5", temporal_type, lag_window)
-            run_homo5_gnn_baseline(
-                pkg=pkg_homo5,
-                temporal_type=temporal_type,
-                lag_window=lag_window,
-                device="cuda",
-                epochs=300,
-                batch_days=8,
-                es_patience=es_patience,
-                es_min_delta=es_min_delta,
-                is_softplus=is_sp,
-                is_log1p=is_log1p,
-                base_dir=base_dir,
-            )
+                # 3) Heterogeneous 5-type
+                pkg_hetero5 = load_gnn_pkg("hetero5", temporal_type, lag_window, horizon=horizon)
+                run_hetero5_gnn_baseline(
+                    pkg=pkg_hetero5,
+                    temporal_type=temporal_type,
+                    lag_window=lag_window,
+                    horizon=horizon,                  # <-- truyền H
+                    device="cuda",
+                    epochs=300,
+                    batch_days=8,
+                    es_patience=es_patience,
+                    es_min_delta=es_min_delta,
+                    is_softplus=is_sp,
+                    is_log1p=is_log1p,
+                    base_dir=base_dir,
+                )
 
-            # 3) Heterogeneous 5-type
-            pkg_hetero5 = load_gnn_pkg("hetero5", temporal_type, lag_window)
-            run_hetero5_gnn_baseline(
-                pkg=pkg_hetero5,
-                temporal_type=temporal_type,
-                lag_window=lag_window,
-                device="cuda",
-                epochs=300,
-                batch_days=8,
-                es_patience=es_patience,
-                es_min_delta=es_min_delta,
-                is_softplus=is_sp,
-                is_log1p=is_log1p,
-                base_dir=base_dir,
-            )
-
+        # Lưu summary cho experiment này
         if RUN_SUMMARY:
             df_sum = pd.DataFrame(RUN_SUMMARY)
             print("\n=== GNN baselines summary (this ExperimentConfig) ===")
@@ -993,7 +1001,6 @@ def main():
             print(f"\nSaved GNN baseline summary to {out_path}")
 
             RUN_SUMMARY = []
-
 
 if __name__ == "__main__":
     main()
