@@ -6,7 +6,7 @@ from config.config import PROC_DIR  # bạn đã dùng trong các script khác
 
 # --------- load summary ----------
 base_dir = Path(PROC_DIR) / "predictions" 
-summary_path = base_dir / "summary_all_baselines.csv"
+summary_path = base_dir / "summary_all_baselines_agg.csv"
 
 df = pd.read_csv(summary_path)
 

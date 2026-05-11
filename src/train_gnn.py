@@ -15,10 +15,16 @@ from config.config import PROC_DIR, DEFAULT_EXPERIMENTS
 
 RUN_SUMMARY = []
 
-LAG_WINDOWS = [7, 14]
 PROJECTED_VIEWS = ["same_group", "same_subgroup", "same_plant", "same_storage"]
 
+import random
 
+def set_global_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 # =========================
 # Transform helpers: train trên z, eval trên y
 # =========================
@@ -216,10 +222,11 @@ def run_projected_gnn_baseline(
     is_softplus: bool = False,
     is_log1p: bool = False,
     base_dir: Path | None = None,
+    seed : int = 42,
 ):
     if is_softplus and is_log1p:
         raise ValueError("Only one of is_softplus / is_log1p can be True.")
-
+    set_global_seed(seed) 
     mode_name = get_mode_name(is_softplus, is_log1p)
     if base_dir is None:
         base_dir = Path(PROC_DIR) / "predictions" / "baseline_4" / f"{temporal_type}_{mode_name}"
@@ -227,7 +234,7 @@ def run_projected_gnn_baseline(
     print(
         f"\n=== Training Projected GNN Baseline "
         f"[H{horizon}][lag{lag_window}][{temporal_type}][view={edge_view}] "
-        f"[mode={mode_name}] ==="
+        f"[mode={mode_name}][seed={seed}] ==="
     )
 
     X = pkg["X_product"].float()   # [T, N, F]
@@ -236,7 +243,7 @@ def run_projected_gnn_baseline(
     days = np.array(pkg["days"])
     split = pkg["split"]
     edge_index_dict = pkg["edge_index_dict"]
-
+    node_ids_product = np.array(pkg["node_ids_product"]) 
     if edge_view not in edge_index_dict:
         raise ValueError(f"edge_view={edge_view} not in {list(edge_index_dict.keys())}")
     edge_index = edge_index_dict[edge_view]
@@ -247,7 +254,7 @@ def run_projected_gnn_baseline(
     device = device if (device == "cuda" and torch.cuda.is_available()) else "cpu"
     model = ProjectedGINRegressor(
         in_channels=Fdim,
-        hidden_channels=128,
+        hidden_channels=96,
         num_layers=3,
         is_softplus=is_softplus,
         is_log1p=is_log1p,
@@ -312,7 +319,32 @@ def run_projected_gnn_baseline(
 
     early_stopper.load_best(model)
     model.eval()
+    # ===== Lưu encoder & toàn bộ regressor cho export embeddings =====
+    encoder_state = model.encoder.state_dict()
+    regressor_state = model.state_dict()
+    enc_out_dir = Path(PROC_DIR) / "gnn" / "trained"
+    enc_out_dir.mkdir(parents=True, exist_ok=True)
 
+    enc_path = (
+        enc_out_dir
+        / f"projected_encoder_{edge_view}_h{horizon}_lag{lag_window}_"
+          f"{temporal_type}_{mode_name}_seed{seed}.pt"
+    )
+    torch.save(
+        {
+            "encoder_state_dict": encoder_state,
+            "regressor_state_dict": regressor_state,
+            "horizon": horizon,
+            "lag_window": lag_window,
+            "temporal_type": temporal_type,
+            "graph_type": "projected",
+            "edge_view": edge_view,
+            "mode": mode_name,
+            "seed": seed,
+        },
+        enc_path,
+    )
+    print(f"[SAVE] Saved trained projected encoder to {enc_path}")
     with torch.no_grad():
         def predict_on_indices(idxs):
             y_true_list = []
@@ -334,6 +366,8 @@ def run_projected_gnn_baseline(
     y_test_true = y_test_true_flat.reshape(T_test, N)
     y_test_pred = y_test_pred_flat.reshape(T_test, N)
     days_test = days[idx_test]
+    product_idx = np.tile(np.arange(N), T_test)
+    node_id_flat = node_ids_product[product_idx]  # map idx -> node_id
 
     mae_train = mae(y_train_true, y_train_pred_flat)
     rmse_train = rmse(y_train_true, y_train_pred_flat)
@@ -350,8 +384,10 @@ def run_projected_gnn_baseline(
     mape_test = mape(y_test_true_flat, y_test_pred_flat)
     smape_test = smape(y_test_true_flat, y_test_pred_flat)
 
-    tag = f"gnn_projected_{edge_view}_h{horizon}_lag{lag_window}_{temporal_type}_{mode_name}"
-
+    tag = (
+        f"gnn_projected_{edge_view}_h{horizon}_lag{lag_window}_"
+        f"{temporal_type}_{mode_name}_seed{seed}"
+    )
     print(f"\n[Projected-{edge_view}][{tag}] Train:")
     print(f"  MAE  : {mae_train:.4f}")
     print(f"  RMSE : {rmse_train:.4f}")
@@ -376,6 +412,7 @@ def run_projected_gnn_baseline(
         {
             "date": np.repeat(days_test, N),
             "product_idx": np.tile(np.arange(N), T_test),
+            "node_id": node_id_flat,
             "y_true": y_test_true_flat,
             "y_pred": y_test_pred_flat,
         }
@@ -401,6 +438,7 @@ def run_projected_gnn_baseline(
             "temporal_type": temporal_type,
             "lag_window": lag_window,
             "horizon": horizon,
+            "seed": seed,  
             "variant": "gnn_projected",
             "tag": tag,
             "edge_view": edge_view,
@@ -438,9 +476,11 @@ def run_homo5_gnn_baseline(
     is_softplus: bool = False,
     is_log1p: bool = False,
     base_dir: Path | None = None,
+    seed: int = 42,
 ):
     if is_softplus and is_log1p:
         raise ValueError("Only one of is_softplus / is_log1p can be True.")
+    set_global_seed(seed)
     mode_name = get_mode_name(is_softplus, is_log1p)
     if base_dir is None:
         base_dir = Path(PROC_DIR) / "predictions" / "baseline_4" / f"{temporal_type}_{mode_name}"
@@ -448,7 +488,7 @@ def run_homo5_gnn_baseline(
     print(
         f"\n=== Training Homogeneous-5type GNN Baseline "
         f"[H{horizon}][lag{lag_window}][{temporal_type}] "
-        f"[mode={mode_name}] ==="
+        f"[mode={mode_name}][seed={seed}] ==="
     )
 
     X_prod = pkg["X_product"].float()
@@ -456,7 +496,7 @@ def run_homo5_gnn_baseline(
     Y_trans = transform_y_tensor(Y_prod, is_softplus, is_log1p)
     days = np.array(pkg["days"])
     split = pkg["split"]
-
+    node_ids_product = np.array(pkg["node_ids_product"])
     edge_index = pkg["edge_index"]          # [2, E_total] flatten
     num_nodes_dict = pkg["num_nodes_dict"]
     nodes_tbl = pkg["nodes_homo_table"]
@@ -470,7 +510,7 @@ def run_homo5_gnn_baseline(
         in_channels=Fdim,
         num_nodes_dict=num_nodes_dict,
         node_type_order=node_type_order,
-        hidden_channels=128,
+        hidden_channels=96,
         num_layers=3,
         node_type_emb_dim=8,
         is_softplus=is_softplus,
@@ -543,7 +583,31 @@ def run_homo5_gnn_baseline(
 
     early_stopper.load_best(model)
     model.eval()
+    # ===== Lưu encoder & regressor cho homo5 =====
+    encoder_state = model.encoder.state_dict()
+    regressor_state = model.state_dict()
+    enc_out_dir = Path(PROC_DIR) / "gnn" / "trained"
+    enc_out_dir.mkdir(parents=True, exist_ok=True)
 
+    enc_path = (
+        enc_out_dir
+        / f"homo5_encoder_h{horizon}_lag{lag_window}_"
+          f"{temporal_type}_{mode_name}_seed{seed}.pt"
+    )
+    torch.save(
+        {
+            "encoder_state_dict": encoder_state,
+            "regressor_state_dict": regressor_state,
+            "horizon": horizon,
+            "lag_window": lag_window,
+            "temporal_type": temporal_type,
+            "graph_type": "homo5",
+            "mode": mode_name,
+            "seed": seed,
+        },
+        enc_path,
+    )
+    print(f"[SAVE] Saved trained homo5 encoder to {enc_path}")
     with torch.no_grad():
         def predict_on_indices(idxs):
             y_true_list = []
@@ -574,6 +638,9 @@ def run_homo5_gnn_baseline(
     y_test_pred = y_test_pred_flat.reshape(T_test, N_prod)
     days_test = days[idx_test]
 
+    product_idx = np.tile(np.arange(N_prod), T_test)
+    node_id_flat = node_ids_product[product_idx]
+
     mae_train = mae(y_train_true, y_train_pred_flat)
     rmse_train = rmse(y_train_true, y_train_pred_flat)
     mape_train = mape(y_train_true, y_train_pred_flat)
@@ -589,7 +656,10 @@ def run_homo5_gnn_baseline(
     mape_test = mape(y_test_true_flat, y_test_pred_flat)
     smape_test = smape(y_test_true_flat, y_test_pred_flat)
 
-    tag = f"gnn_homo5_h{horizon}_lag{lag_window}_{temporal_type}_{mode_name}"
+    tag = (
+        f"gnn_homo5_h{horizon}_lag{lag_window}_"
+        f"{temporal_type}_{mode_name}_seed{seed}"
+    )
 
     print(f"\n[Homo5][{tag}] Train:")
     print(f"  MAE  : {mae_train:.4f}")
@@ -615,6 +685,7 @@ def run_homo5_gnn_baseline(
         {
             "date": np.repeat(days_test, N_prod),
             "product_idx": np.tile(np.arange(N_prod), T_test),
+            "node_id": node_id_flat,
             "y_true": y_test_true_flat,
             "y_pred": y_test_pred_flat,
         }
@@ -640,6 +711,7 @@ def run_homo5_gnn_baseline(
             "temporal_type": temporal_type,
             "lag_window": lag_window,
             "horizon": horizon,
+            "seed": seed,
             "variant": "gnn_homo5",
             "tag": tag,
             "edge_view": None,
@@ -677,9 +749,11 @@ def run_hetero5_gnn_baseline(
     is_softplus: bool = False,
     is_log1p: bool = False,
     base_dir: Path | None = None,
+    seed: int = 42,
 ):
     if is_softplus and is_log1p:
         raise ValueError("Only one of is_softplus / is_log1p can be True.")
+    set_global_seed(seed)   
     mode_name = get_mode_name(is_softplus, is_log1p)
     if base_dir is None:
         base_dir = Path(PROC_DIR) / "predictions" / "baseline_4" / f"{temporal_type}_{mode_name}"
@@ -687,7 +761,7 @@ def run_hetero5_gnn_baseline(
     print(
         f"\n=== Training Heterogeneous-5type GNN Baseline "
         f"[H{horizon}][lag{lag_window}][{temporal_type}] "
-        f"[mode={mode_name}] ==="
+        f"[mode={mode_name}][seed={seed}] ==="
     )
 
     X_prod = pkg["X_product"].float()
@@ -697,7 +771,7 @@ def run_hetero5_gnn_baseline(
     split = pkg["split"]
     edge_index_dict = pkg["edge_index_dict"]
     num_nodes_dict = pkg["num_nodes_dict"]
-
+    node_ids_product = np.array(pkg["node_ids_product"])
     idx_train, idx_val, idx_test = get_time_splits(days, split)
     T, N_prod, Fdim = X_prod.shape
 
@@ -710,7 +784,7 @@ def run_hetero5_gnn_baseline(
     device = device if (device == "cuda" and torch.cuda.is_available()) else "cpu"
     model = HeterogeneousGINRegressor(
         in_channels_dict=in_channels_dict,
-        hidden_channels=128,
+        hidden_channels=96,
         num_layers=2,
         is_softplus=is_softplus,
         is_log1p=is_log1p,
@@ -779,7 +853,31 @@ def run_hetero5_gnn_baseline(
 
     early_stopper.load_best(model)
     model.eval()
+    # ===== Lưu encoder & regressor cho hetero5 =====
+    encoder_state = model.encoder.state_dict()
+    regressor_state = model.state_dict()
+    enc_out_dir = Path(PROC_DIR) / "gnn" / "trained"
+    enc_out_dir.mkdir(parents=True, exist_ok=True)
 
+    enc_path = (
+        enc_out_dir
+        / f"hetero5_encoder_h{horizon}_lag{lag_window}_"
+          f"{temporal_type}_{mode_name}_seed{seed}.pt"
+    )
+    torch.save(
+        {
+            "encoder_state_dict": encoder_state,
+            "regressor_state_dict": regressor_state,
+            "horizon": horizon,
+            "lag_window": lag_window,
+            "temporal_type": temporal_type,
+            "graph_type": "hetero5",
+            "mode": mode_name,
+            "seed": seed,
+        },
+        enc_path,
+    )
+    print(f"[SAVE] Saved trained hetero5 encoder to {enc_path}")
     with torch.no_grad():
         def predict_on_indices(idxs):
             y_true_list = []
@@ -807,7 +905,8 @@ def run_hetero5_gnn_baseline(
     y_test_true = y_test_true_flat.reshape(T_test, N_prod)
     y_test_pred = y_test_pred_flat.reshape(T_test, N_prod)
     days_test = days[idx_test]
-
+    product_idx = np.tile(np.arange(N_prod), T_test)
+    node_id_flat = node_ids_product[product_idx]
     mae_train = mae(y_train_true, y_train_pred_flat)
     rmse_train = rmse(y_train_true, y_train_pred_flat)
     mape_train = mape(y_train_true, y_train_pred_flat)
@@ -823,8 +922,10 @@ def run_hetero5_gnn_baseline(
     mape_test = mape(y_test_true_flat, y_test_pred_flat)
     smape_test = smape(y_test_true_flat, y_test_pred_flat)
 
-    tag = f"gnn_hetero5_h{horizon}_lag{lag_window}_{temporal_type}_{mode_name}"
-
+    tag = (
+        f"gnn_hetero5_h{horizon}_lag{lag_window}_"
+        f"{temporal_type}_{mode_name}_seed{seed}"
+    )
     print(f"\n[Hetero5][{tag}] Train:")
     print(f"  MAE  : {mae_train:.4f}")
     print(f"  RMSE : {rmse_train:.4f}")
@@ -849,6 +950,7 @@ def run_hetero5_gnn_baseline(
         {
             "date": np.repeat(days_test, N_prod),
             "product_idx": np.tile(np.arange(N_prod), T_test),
+            "node_id": node_id_flat,
             "y_true": y_test_true_flat,
             "y_pred": y_test_pred_flat,
         }
@@ -874,6 +976,7 @@ def run_hetero5_gnn_baseline(
             "temporal_type": temporal_type,
             "lag_window": lag_window,
             "horizon": horizon,
+            "seed": seed,
             "variant": "gnn_hetero5",
             "tag": tag,
             "edge_view": None,
@@ -904,7 +1007,7 @@ def main():
 
     es_patience = 20
     es_min_delta = 0.001
-
+    seeds = [0, 1, 2] 
     for exp in DEFAULT_EXPERIMENTS:
         temporal_type = exp.temporal_type
         is_sp = exp.is_softplus
@@ -921,20 +1024,38 @@ def main():
 
         for horizon in exp.horizons:             # <-- loop tất cả H
             for lag_window in exp.lag_windows:
-                print(
-                    f"\n############ GNN Baselines: temporal={temporal_type}, "
-                    f"H={horizon}, lag={lag_window} ############"
-                )
+                for seed in seeds:
+                    print(
+                        f"\n############ GNN Baselines: temporal={temporal_type}, "
+                        f"H={horizon}, lag={lag_window}, seed={seed} ############"
+                    )
+                    # 1) Projected
+                    pkg_proj = load_gnn_pkg("projected", temporal_type, lag_window, horizon=horizon)
+                    for view in PROJECTED_VIEWS:
+                        run_projected_gnn_baseline(
+                            pkg=pkg_proj,
+                            temporal_type=temporal_type,
+                            lag_window=lag_window,
+                            horizon=horizon,              # <-- truyền H
+                            edge_view=view,
+                            device="cuda",
+                            epochs=300,
+                            batch_days=8,
+                            es_patience=es_patience,
+                            es_min_delta=es_min_delta,
+                            is_softplus=is_sp,
+                            is_log1p=is_log1p,
+                            base_dir=base_dir,
+                            seed=seed,
+                        )
 
-                # 1) Projected
-                pkg_proj = load_gnn_pkg("projected", temporal_type, lag_window, horizon=horizon)
-                for view in PROJECTED_VIEWS:
-                    run_projected_gnn_baseline(
-                        pkg=pkg_proj,
+                    # 2) Homogeneous 5-type
+                    pkg_homo5 = load_gnn_pkg("homo5", temporal_type, lag_window, horizon=horizon)
+                    run_homo5_gnn_baseline(
+                        pkg=pkg_homo5,
                         temporal_type=temporal_type,
                         lag_window=lag_window,
-                        horizon=horizon,              # <-- truyền H
-                        edge_view=view,
+                        horizon=horizon,                  # <-- truyền H
                         device="cuda",
                         epochs=300,
                         batch_days=8,
@@ -943,41 +1064,26 @@ def main():
                         is_softplus=is_sp,
                         is_log1p=is_log1p,
                         base_dir=base_dir,
+                        seed=seed,
                     )
 
-                # 2) Homogeneous 5-type
-                pkg_homo5 = load_gnn_pkg("homo5", temporal_type, lag_window, horizon=horizon)
-                run_homo5_gnn_baseline(
-                    pkg=pkg_homo5,
-                    temporal_type=temporal_type,
-                    lag_window=lag_window,
-                    horizon=horizon,                  # <-- truyền H
-                    device="cuda",
-                    epochs=300,
-                    batch_days=8,
-                    es_patience=es_patience,
-                    es_min_delta=es_min_delta,
-                    is_softplus=is_sp,
-                    is_log1p=is_log1p,
-                    base_dir=base_dir,
-                )
-
-                # 3) Heterogeneous 5-type
-                pkg_hetero5 = load_gnn_pkg("hetero5", temporal_type, lag_window, horizon=horizon)
-                run_hetero5_gnn_baseline(
-                    pkg=pkg_hetero5,
-                    temporal_type=temporal_type,
-                    lag_window=lag_window,
-                    horizon=horizon,                  # <-- truyền H
-                    device="cuda",
-                    epochs=300,
-                    batch_days=8,
-                    es_patience=es_patience,
-                    es_min_delta=es_min_delta,
-                    is_softplus=is_sp,
-                    is_log1p=is_log1p,
-                    base_dir=base_dir,
-                )
+                    # 3) Heterogeneous 5-type
+                    pkg_hetero5 = load_gnn_pkg("hetero5", temporal_type, lag_window, horizon=horizon)
+                    run_hetero5_gnn_baseline(
+                        pkg=pkg_hetero5,
+                        temporal_type=temporal_type,
+                        lag_window=lag_window,
+                        horizon=horizon,                  # <-- truyền H
+                        device="cuda",
+                        epochs=300,
+                        batch_days=8,
+                        es_patience=es_patience,
+                        es_min_delta=es_min_delta,
+                        is_softplus=is_sp,
+                        is_log1p=is_log1p,
+                        base_dir=base_dir,
+                        seed=seed,
+                    )
 
         # Lưu summary cho experiment này
         if RUN_SUMMARY:
@@ -988,6 +1094,7 @@ def main():
                     "temporal_type",
                     "lag_window",
                     "horizon",
+                    "seed",
                     "variant",
                     "tag",
                     "edge_view",

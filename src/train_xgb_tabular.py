@@ -13,6 +13,11 @@ experiment = DEFAULT_EXPERIMENTS
 
 RUN_SUMMARY: list[dict] = []
 
+import random
+
+def set_global_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
 
 # =========================
 # Metrics
@@ -129,15 +134,20 @@ def train_xgb_tabular_baseline(
     lag_window: int = 7,
     horizon: int = 7,
     tag: str | None = None,
+    seed: int = 42,
 ) -> None:
     target_type = "raw"
     if tag is None:
-        tag = f"baseline1_xgb_tabular_{target_type}_h{horizon}_lag{lag_window}_{temporal_type}"
+        tag = (
+            f"baseline1_xgb_tabular_{target_type}_h{horizon}_lag{lag_window}_"
+            f"{temporal_type}_seed{seed}"
+        )
+    set_global_seed(seed)    # <--- cố định RNG cho run này
 
     print(
         f"\n=== Training XGBoost TABULAR baseline (Baseline 1) "
         f"H{horizon}, lag={lag_window}, temporal_type={temporal_type}, "
-        f"target_type={target_type}, tag={tag} ==="
+        f"target_type={target_type}, tag={tag}, seed={seed} ==="
     )
 
     # 1) Load tabular baseline dataset
@@ -178,7 +188,7 @@ def train_xgb_tabular_baseline(
         colsample_bytree=0.8,
         objective="reg:squarederror",
         tree_method="hist",
-        random_state=42,
+        random_state=seed,
         n_jobs=-1,
         eval_metric="rmse",
         early_stopping_rounds=100,
@@ -292,7 +302,7 @@ def train_xgb_tabular_baseline(
         PROC_DIR
         / "baseline"
         / "xgboost"
-        / f"xgboost_predictions_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
+        / f"xgboost_predictions_h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}.parquet"
     )
     pred_path.parent.mkdir(parents=True, exist_ok=True)
     df_all_pred.to_parquet(pred_path, index=False)
@@ -314,7 +324,10 @@ def train_xgb_tabular_baseline(
             "y_pred": y_test_pred,
         }
     )
-    out_pred_file = out_dir_csv / f"xgb_tabular_h{horizon}_lag{lag_window}_{target_type}_test_predictions_{temporal_type}.csv"
+    out_pred_file = (
+    out_dir_csv
+    / f"xgb_tabular_h{horizon}_lag{lag_window}_{target_type}_"
+      f"test_predictions_{temporal_type}_seed{seed}.csv")
     df_test_pred.to_csv(out_pred_file, index=False)
     print(f"\nSaved test predictions to {out_pred_file}")
 
@@ -334,6 +347,7 @@ def train_xgb_tabular_baseline(
             "temporal_type": temporal_type,
             "lag_window": lag_window,
             "horizon": horizon,
+            "seed": seed,
             "variant": f"baseline_1_xgb_tabular_{target_type}",
             "tag": tag,
             "target_type": target_type,
@@ -361,25 +375,32 @@ def main():
     global RUN_SUMMARY
     RUN_SUMMARY = []
 
+    seeds = [0, 1, 2]   # ví dụ 3 seed
+
     for exp in DEFAULT_EXPERIMENTS:
         temporal_type = exp.temporal_type
         horizons = list(exp.horizons)
-        lag_windows = list(exp.lag_windows)  # dùng lag_windows, không phải gru_seq_lengths
+        lag_windows = list(exp.lag_windows)
 
         for lag_window in lag_windows:
             for horizon in horizons:
-                train_xgb_tabular_baseline(
-                    temporal_type=temporal_type,
-                    lag_window=lag_window,
-                    horizon=horizon,
-                    tag=f"baseline1_xgb_tabular_raw_h{horizon}_lag{lag_window}_{temporal_type}",
-                )
+                for seed in seeds:
+                    train_xgb_tabular_baseline(
+                        temporal_type=temporal_type,
+                        lag_window=lag_window,
+                        horizon=horizon,
+                        tag=(
+                            f"baseline1_xgb_tabular_raw_h{horizon}_lag{lag_window}_"
+                            f"{temporal_type}_seed{seed}"
+                        ),
+                        seed=seed,
+                    )
 
     if RUN_SUMMARY:
         df_sum = pd.DataFrame(RUN_SUMMARY)
-        print("\n=== Baseline 1 (XGB Tabular) summary ===")
+        print("\n=== Baseline 1 (XGB Tabular) summary with seeds ===")
         df_sum = df_sum.sort_values(
-            ["temporal_type", "lag_window", "horizon", "target_type", "tag"]
+            ["temporal_type", "lag_window", "horizon", "target_type", "seed", "tag"]
         )
         print(
             df_sum[
@@ -388,6 +409,7 @@ def main():
                     "lag_window",
                     "horizon",
                     "target_type",
+                    "seed",
                     "tag",
                     "n_features",
                     "MAE_train",
@@ -404,12 +426,11 @@ def main():
             PROC_DIR
             / "predictions"
             / "baseline_1"
-            / "summary_xgb_tabular_baseline1_raw_targets_lags.csv"
+            / "summary_xgb_tabular_baseline1_raw_targets_lags_with_seeds.csv"
         )
         out_path.parent.mkdir(parents=True, exist_ok=True)
         df_sum.to_csv(out_path, index=False)
-        print(f"\nSaved baseline 1 summary to {out_path}")
-
+        print(f"\nSaved baseline 1 summary (with seeds) to {out_path}")
 
 if __name__ == "__main__":
     main()

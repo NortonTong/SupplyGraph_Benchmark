@@ -7,7 +7,7 @@ from sklearn.metrics import mean_absolute_error, root_mean_squared_error
 
 from config.config import PROC_DIR
 
-NAIVE_DIR = PROC_DIR / "predictions_naive"
+NAIVE_DIR = PROC_DIR / "predictions" / "naive"
 NAIVE_DIR.mkdir(parents=True, exist_ok=True)
 
 RUN_SUMMARY: list[dict] = []

@@ -11,6 +11,14 @@ import matplotlib.pyplot as plt
 
 from config.config import PROC_DIR, DEFAULT_EXPERIMENTS
 
+import random
+
+def set_global_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 # ====================== Metrics ======================
 
@@ -331,6 +339,7 @@ def train_one_gru(
     temporal_type: str = "unit",
     is_softplus: bool = False,
     is_log1p: bool = False,
+    seed: int = 42,
 ):
     """
     - is_softplus / is_log1p điều khiển output layer trong GRURegressor.
@@ -338,7 +347,7 @@ def train_one_gru(
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-
+    set_global_seed(seed)
     df = load_baseline(
         horizon=horizon,
         temporal_type=temporal_type,
@@ -516,7 +525,8 @@ def train_one_gru(
     # ===== Lưu model theo folder transform_tag =====
     out_dir_model = PROC_DIR / "models" / "gru" / "baseline_2" / transform_tag
     out_dir_model.mkdir(parents=True, exist_ok=True)
-    model_path = out_dir_model / f"gru_baseline2_h{horizon}_w{window}_{temporal_type}.pth"
+    model_path = out_dir_model / f"gru_baseline2_h{horizon}_w{window}_{temporal_type}_seed{seed}.pth"
+
     torch.save(
         {
             "state_dict": model.state_dict(),
@@ -548,8 +558,7 @@ def train_one_gru(
     df_test_pred = meta_test.copy()
     df_test_pred["y_true"] = test_trues
     df_test_pred["y_pred"] = test_preds
-    out_pred_file = out_dir_pred / f"gru_baseline2_h{horizon}_w{window}_test_predictions.csv"
-    df_test_pred.to_csv(out_pred_file, index=False)
+    out_pred_file = out_dir_pred / f"gru_baseline2_h{horizon}_w{window}_seed{seed}_test_predictions.csv"
     print(f"Saved GRU test predictions to {out_pred_file}")
 
     # ===== Lưu plots theo folder transform_tag =====
@@ -582,6 +591,7 @@ def train_one_gru(
         "tag": tag,
         "temporal_type": temporal_type,
         "output_transform": transform_tag,
+        "seed": seed,
         "train_rmse": train_rmse,
         "train_mae": train_mae,
         "train_mape": train_mape_val,
@@ -608,7 +618,7 @@ def main():
     summaries = []
 
     experiments = DEFAULT_EXPERIMENTS
-
+    seeds = [0,1,2]
     for exp in experiments:
         temporal_type = exp.temporal_type
         horizons = list(exp.horizons)
@@ -625,44 +635,46 @@ def main():
 
         for horizon in horizons:
             for window in lag_windows:
-                tag = f"gru_baseline2_h{horizon}_w{window}_{transform_tag}_{temporal_type}"
-                print(
-                    f"\n=== Fixed-split GRU baseline 2: "
-                    f"H={horizon}, window={window}, output={transform_tag}, "
-                    f"temporal_type={temporal_type} ==="
-                )
+                for seed in seeds:
+                    tag = f"gru_baseline2_h{horizon}_w{window}_{transform_tag}_{temporal_type}"
+                    print(
+                        f"\n=== Fixed-split GRU baseline 2: "
+                        f"H={horizon}, window={window}, output={transform_tag}, "
+                        f"temporal_type={temporal_type} ==="
+                    )
 
-                _, info = train_one_gru(
-                    horizon=horizon,
-                    window=window,
-                    hidden_size=128,
-                    num_layers=2,
-                    dropout=0.2,
-                    batch_size=256,
-                    n_epochs=400,
-                    lr=1e-3,
-                    tag=tag,
-                    patience=40,
-                    min_delta=0.0,
-                    temporal_type=temporal_type,
-                    is_softplus=is_softplus,
-                    is_log1p=is_log1p,
-                )
+                    _, info = train_one_gru(
+                        horizon=horizon,
+                        window=window,
+                        hidden_size=128,
+                        num_layers=2,
+                        dropout=0.2,
+                        batch_size=256,
+                        n_epochs=400,
+                        lr=1e-3,
+                        tag=tag,
+                        patience=40,
+                        min_delta=0.0,
+                        temporal_type=temporal_type,
+                        is_softplus=is_softplus,
+                        is_log1p=is_log1p,
+                        seed = seed,
+                    )
 
-                # đảm bảo info có đủ metadata
-                info["temporal_type"] = temporal_type
-                info["horizon"] = horizon
-                info["window"] = window
-                info["output_transform"] = transform_tag
-                info["tag"] = tag
-
-                summaries.append(info)
+                    # đảm bảo info có đủ metadata
+                    info["temporal_type"] = temporal_type
+                    info["horizon"] = horizon
+                    info["window"] = window
+                    info["output_transform"] = transform_tag
+                    info["tag"] = tag
+                    info["seed"] = seed
+                    summaries.append(info)
 
     # Tổng hợp kết quả fixed-split
     if summaries:
         df_sum = pd.DataFrame(summaries)
         df_sum = df_sum.sort_values(
-            ["temporal_type", "window", "horizon", "output_transform", "tag"]
+            ["temporal_type", "window", "horizon", "output_transform", "seed", "tag"]
         )
 
         print("\n=== GRU Baseline 2 (fixed split) summary ===")

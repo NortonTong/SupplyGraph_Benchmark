@@ -8,12 +8,16 @@ from models_gnn_encoder import (
     HomogeneousFiveTypeGINEncoder,
     HeterogeneousGINEncoder,
 )
-
+from typing import Literal
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 0)
 
 GNN_DIR = PROC_DIR / "gnn"
 GNN_DIR.mkdir(parents=True, exist_ok=True)
+
+# Chứa encoder checkpoints đã train, bạn đã save ở đây khi train GNN
+GNN_TRAINED_DIR = GNN_DIR / "trained"
+GNN_TRAINED_DIR.mkdir(parents=True, exist_ok=True)
 
 EMB_DIR = PROC_DIR / "gnn_embeddings"
 EMB_DIR.mkdir(parents=True, exist_ok=True)
@@ -21,18 +25,194 @@ EMB_DIR.mkdir(parents=True, exist_ok=True)
 XGB_GNN_EMBED_DIR = PROC_DIR / "baseline" / "xgb_gnn_embed"
 XGB_GNN_EMBED_DIR.mkdir(parents=True, exist_ok=True)
 
+
 def get_experiment_params():
     temporal_types = sorted({exp.temporal_type for exp in DEFAULT_EXPERIMENTS})
     horizons = sorted({h for exp in DEFAULT_EXPERIMENTS for h in exp.horizons})
     lag_windows = sorted({L for exp in DEFAULT_EXPERIMENTS for L in exp.lag_windows})
-    # Không còn ép chỉ 1 horizon
     return temporal_types, horizons, lag_windows
 
 
 TEMPORAL_TYPES, HORIZONS, LAG_WINDOWS = get_experiment_params()
+from pathlib import Path
+import pandas as pd
+import numpy as np
+
+from config.config import PROC_DIR
+
+EMB_DIR = PROC_DIR / "gnn_embeddings"
+XGB_BASE_DIR = PROC_DIR / "baseline" / "xgboost"
+XGB_GNN_EMBED_DIR = PROC_DIR / "baseline" / "xgb_gnn_embed"
+XGB_GNN_EMBED_DIR.mkdir(parents=True, exist_ok=True)
+
+PROJECTED_VIEWS = ["same_group", "same_subgroup", "same_plant", "same_storage"]
 
 
+def build_xgb_tabular_gnnembed_projected4view(
+    horizon: int,
+    lag_window: int,
+    temporal_type: str,
+    seed: int,
+    mode_name: str = "raw",
+) -> None:
+    # 1) Load tabular base
+    base_path = (
+        XGB_BASE_DIR
+        / f"xgboost_tabular_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
+    )
+    if not base_path.exists():
+        print(f"[XGB-GNNEMB-PROJ] Base tabular not found: {base_path}, skip.")
+        return
 
+    df_base = pd.read_parquet(base_path)
+    df_base["node_id"] = df_base["node_id"].astype(str)
+    df_base["day"] = df_base["day"].astype(int)
+    df_base["node_index"] = df_base["node_index"].astype(int)
+
+    # Đảm bảo unique trên (day, node_index)
+    df_base = (
+        df_base.sort_values(["day", "node_index", "date"])
+        .drop_duplicates(subset=["day", "node_index"], keep="last")
+    )
+    print(
+        f"[XGB-GNNEMB-PROJ] base rows={len(df_base)}, "
+        f"unique(day,node_index)={df_base[['day','node_index']].drop_duplicates().shape[0]}"
+    )
+
+    # 2) Load projected 4-view embeddings (long)
+    emb_path = (
+        EMB_DIR
+        / f"gnn_projected_emb_4views_h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}_{mode_name}.parquet"
+    )
+    if not emb_path.exists():
+        print(f"[XGB-GNNEMB-PROJ] Embedding file not found: {emb_path}, skip.")
+        return
+
+    df_emb = pd.read_parquet(emb_path)
+    df_emb["day"] = df_emb["day"].astype(int)
+    df_emb["node_index_pos"] = df_emb["node_index_pos"].astype(int)
+
+    # Map node_index_pos -> node_index (giống build_time_tensors_from_xgb_for_gnn)
+    # node_index_product trong pkg_common đã sort; ở đây ta tái lập mapping từ base
+    node_indices = np.sort(df_base["node_index"].unique())
+    pos2nodeindex = {pos: int(idx) for pos, idx in enumerate(node_indices)}
+
+    df_emb["node_index"] = df_emb["node_index_pos"].map(pos2nodeindex)
+
+    # 3) Pivot 4 view thành 1 hàng (day, node_index)
+    dfs = []
+    for view in PROJECTED_VIEWS:
+        d_v = df_emb[df_emb["view"] == view].copy()
+        if d_v.empty:
+            print(f"[XGB-GNNEMB-PROJ] Warning: no rows for view={view}")
+            continue
+
+        emb_cols = [c for c in d_v.columns if c.startswith("emb_")]
+        d_v = d_v[["day", "node_index"] + emb_cols]
+
+        # rename emb_0 -> emb_0_same_group, ...
+        d_v = d_v.rename(columns={c: f"{c}_{view}" for c in emb_cols})
+
+        dfs.append(d_v)
+
+    if not dfs:
+        print(f"[XGB-GNNEMB-PROJ] No embeddings for any view, skip.")
+        return
+
+    from functools import reduce
+
+    df_emb_wide = reduce(
+        lambda left, right: left.merge(
+            right, on=["day", "node_index"], how="inner"
+        ),
+        dfs,
+    )
+    print(
+        f"[XGB-GNNEMB-PROJ] emb_wide rows={len(df_emb_wide)}, "
+        f"unique(day,node_index)={df_emb_wide[['day','node_index']].drop_duplicates().shape[0]}"
+    )
+
+    # 4) Join base + embeddings theo (day, node_index)
+    df_merged = df_base.merge(
+        df_emb_wide,
+        on=["day", "node_index"],
+        how="inner",        # chỉ giữ sample có đủ embedding
+        validate="1:1",
+    )
+    print(
+        f"[XGB-GNNEMB-PROJ] merged rows={len(df_merged)}, "
+        f"unique(day,node_index)={df_merged[['day','node_index']].drop_duplicates().shape[0]}"
+    )
+
+    out_path = (
+        XGB_GNN_EMBED_DIR
+        / f"xgboost_tabular_gnnembed_projected4view_"
+          f"h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}.parquet"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df_merged.to_parquet(out_path, index=False)
+    print(f"[XGB-GNNEMB-PROJ] Saved tabular+projected4view to {out_path}")
+
+def build_xgb_tabular_gnnembed_homo_or_hetero(
+    horizon: int,
+    lag_window: int,
+    temporal_type: str,
+    seed: int,
+    mode_name: str = "raw",
+    graph_type: Literal["homo5", "hetero5"] = "homo5",
+) -> None:
+    base_path = (
+        XGB_BASE_DIR
+        / f"xgboost_tabular_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
+    )
+    if not base_path.exists():
+        print(f"[XGB-GNNEMB-{graph_type}] Base tabular not found: {base_path}, skip.")
+        return
+
+    df_base = pd.read_parquet(base_path)
+    df_base["node_id"] = df_base["node_id"].astype(str)
+    df_base["day"] = df_base["day"].astype(int)
+    df_base["node_index"] = df_base["node_index"].astype(int)
+
+    df_base = (
+        df_base.sort_values(["day", "node_index", "date"])
+        .drop_duplicates(subset=["day", "node_index"], keep="last")
+    )
+
+    if graph_type == "homo5":
+        emb_fname = f"gnn_homo5_emb_h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}_{mode_name}.parquet"
+        out_fname = f"xgboost_tabular_gnnembed_homo5_h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}.parquet"
+    else:
+        emb_fname = f"gnn_hetero5_emb_h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}_{mode_name}.parquet"
+        out_fname = f"xgboost_tabular_gnnembed_hetero5_h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}.parquet"
+
+    emb_path = EMB_DIR / emb_fname
+    if not emb_path.exists():
+        print(f"[XGB-GNNEMB-{graph_type}] Embedding file not found: {emb_path}, skip.")
+        return
+
+    df_emb = pd.read_parquet(emb_path)
+    df_emb["day"] = df_emb["day"].astype(int)
+    df_emb["node_index_pos"] = df_emb["node_index_pos"].astype(int)
+
+    node_indices = np.sort(df_base["node_index"].unique())
+    pos2nodeindex = {pos: int(idx) for pos, idx in enumerate(node_indices)}
+    df_emb["node_index"] = df_emb["node_index_pos"].map(pos2nodeindex)
+
+    emb_cols = [c for c in df_emb.columns if c.startswith("emb_")]
+    df_emb_slim = df_emb[["day", "node_index"] + emb_cols]
+
+    df_merged = df_base.merge(
+        df_emb_slim,
+        on=["day", "node_index"],
+        how="inner",
+        validate="1:1",
+    )
+
+    out_path = XGB_GNN_EMBED_DIR / out_fname
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df_merged.to_parquet(out_path, index=False)
+    print(f"[XGB-GNNEMB-{graph_type}] Saved tabular+{graph_type} to {out_path}")
 
 # ============================================================
 # 1. EXPORT EMBEDDINGS
@@ -44,19 +224,17 @@ PROJECTED_VIEWS = ["same_group", "same_subgroup", "same_plant", "same_storage"]
 def export_projected_embeddings_for_config(
     temporal_type: str,
     lag_window: int,
-    horizon: int,           # <-- thêm
+    horizon: int,
     device: str = "cuda",
+    seed: int = 0,
+    mode_name: str = "raw",  # "raw" / "softplus" / "log1p"
 ) -> None:
-    """
-    Đọc gnn_projected_h{horizon}_lag{L}_{temporal_type}.pt
-    → với mỗi view trong PROJECTED_VIEWS, chạy encoder, lưu embedding dạng long.
-    """
     pkg_path = GNN_DIR / f"gnn_projected_h{horizon}_lag{lag_window}_{temporal_type}.pt"
     if not pkg_path.exists():
         print(f"[EXPORT-PROJ] {pkg_path} not found, skip.")
         return
 
-    print(f"[EXPORT-PROJ] Loading package from {pkg_path}")
+    print(f"[EXPORT-PROJ] Loading graph package from {pkg_path}")
     pkg = torch.load(pkg_path, map_location=device, weights_only=False)
     X_product = pkg["X_product"]          # [T, N_prod, F_in]
     days = pkg["days"]                    # tensor [T]
@@ -65,16 +243,30 @@ def export_projected_embeddings_for_config(
 
     T, N_prod, F_in = X_product.shape
 
-    encoder = ProjectedGINEncoder(
-        in_channels=F_in,
-        hidden_channels=128,
-        num_layers=3,
-    ).to(device)
-    encoder.eval()
-
     rows = []
     with torch.no_grad():
         for view_name in PROJECTED_VIEWS:
+            # 1) load encoder theo view
+            enc_path = (
+                GNN_TRAINED_DIR
+                / f"projected_encoder_{view_name}_h{horizon}_lag{lag_window}_"
+                  f"{temporal_type}_{mode_name}_seed{seed}.pt"
+            )
+            if not enc_path.exists():
+                print(f"[EXPORT-PROJ] encoder for view={view_name} not found: {enc_path}, skip this view.")
+                continue
+
+            print(f"[EXPORT-PROJ] Loading trained encoder for view={view_name} from {enc_path}")
+            enc_pkg = torch.load(enc_path, map_location=device, weights_only=False)
+
+            encoder = ProjectedGINEncoder(
+                in_channels=F_in,
+                hidden_channels=96,
+                num_layers=3,
+            ).to(device)
+            encoder.load_state_dict(enc_pkg["encoder_state_dict"])
+            encoder.eval()
+
             if view_name not in edge_index_dict:
                 print(
                     f"[EXPORT-PROJ] view {view_name} not in edge_index_dict, "
@@ -107,14 +299,14 @@ def export_projected_embeddings_for_config(
     if not rows:
         print(
             f"[EXPORT-PROJ] No embeddings exported for temporal_type={temporal_type}, "
-            f"lag={lag_window}"
+            f"lag={lag_window}, H={horizon}"
         )
         return
 
     df_emb = pd.DataFrame(rows)
     out_path = (
         EMB_DIR
-        / f"gnn_projected_emb_4views_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
+        / f"gnn_projected_emb_4views_h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}_{mode_name}.parquet"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df_emb.to_parquet(out_path, index=False)
@@ -123,19 +315,21 @@ def export_projected_embeddings_for_config(
 def export_homo5_embeddings_for_config(
     temporal_type: str,
     lag_window: int,
-    horizon: int,           # <-- thêm
+    horizon: int,
     device: str = "cuda",
+    seed: int = 0,
+    mode_name: str = "raw",
 ) -> None:
     """
-    Đọc gnn_homo5_h{horizon}_lag{L}_{temporal_type}.pt
-    → chạy HomogeneousFiveTypeGINEncoder ...
+    Đọc gnn_homo5_h{horizon}_lag{L}_{temporal_type}.pt (graph data)
+    + encoder đã train → chạy HomogeneousFiveTypeGINEncoder → embedding cho product.
     """
     pkg_path = GNN_DIR / f"gnn_homo5_h{horizon}_lag{lag_window}_{temporal_type}.pt"
     if not pkg_path.exists():
         print(f"[EXPORT-HOMO5] {pkg_path} not found, skip.")
         return
 
-    print(f"[EXPORT-HOMO5] Loading package from {pkg_path}")
+    print(f"[EXPORT-HOMO5] Loading graph package from {pkg_path}")
     pkg = torch.load(pkg_path, map_location=device, weights_only=False)
     if "edge_index" not in pkg:
         print(
@@ -155,14 +349,27 @@ def export_homo5_embeddings_for_config(
     node_type_order = nodes_tbl["node_type"].unique().tolist()
     T, N_prod, F_in = X_product.shape
 
+    # encoder checkpoint
+    enc_path = (
+        GNN_TRAINED_DIR
+        / f"homo5_encoder_h{horizon}_lag{lag_window}_{temporal_type}_{mode_name}_seed{seed}.pt"
+    )
+    if not enc_path.exists():
+        print(f"[EXPORT-HOMO5] encoder checkpoint not found: {enc_path}, skip.")
+        return
+
+    print(f"[EXPORT-HOMO5] Loading trained encoder from {enc_path}")
+    enc_pkg = torch.load(enc_path, map_location=device, weights_only=False)
+
     encoder = HomogeneousFiveTypeGINEncoder(
         in_channels=F_in,
         num_nodes_dict=num_nodes_dict,
         node_type_order=node_type_order,
-        hidden_channels=128,
+        hidden_channels=96,
         num_layers=3,
         node_type_emb_dim=8,
     ).to(device)
+    encoder.load_state_dict(enc_pkg["encoder_state_dict"])
     encoder.eval()
 
     rows = []
@@ -203,33 +410,39 @@ def export_homo5_embeddings_for_config(
     if not rows:
         print(
             f"[EXPORT-HOMO5] No embeddings exported for temporal_type={temporal_type}, "
-            f"lag={lag_window}"
+            f"lag={lag_window}, H={horizon}"
         )
         return
 
     df_emb = pd.DataFrame(rows)
-    out_path = EMB_DIR / f"gnn_homo5_emb_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
+    out_path = (
+        EMB_DIR
+        / f"gnn_homo5_emb_h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}_{mode_name}.parquet"
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df_emb.to_parquet(out_path, index=False)
     print(f"[EXPORT-HOMO5] Saved homo5 embeddings to {out_path}")
 
+
 def export_hetero5_embeddings_for_config(
     temporal_type: str,
     lag_window: int,
-    horizon: int,           # <-- thêm
+    horizon: int,
     device: str = "cuda",
+    seed: int = 0,
+    mode_name: str = "raw",
 ) -> None:
     """
-    Đọc gnn_hetero5_h{horizon}_lag{lag_window}_{temporal_type}.pt
-    → chạy HeterogeneousGINEncoder → embedding cho product nodes.
+    Đọc gnn_hetero5_h{horizon}_lag{lag_window}_{temporal_type}.pt (graph data)
+    + encoder đã train → HeterogeneousGINEncoder → embedding cho product nodes.
     """
     pkg_path = GNN_DIR / f"gnn_hetero5_h{horizon}_lag{lag_window}_{temporal_type}.pt"
     if not pkg_path.exists():
         print(f"[EXPORT-HET5] {pkg_path} not found, skip.")
         return
 
-    print(f"[EXPORT-HET5] Loading package from {pkg_path}")
-    pkg = torch.load(pkg_path, map_location=device, weights_only = False)
+    print(f"[EXPORT-HET5] Loading graph package from {pkg_path}")
+    pkg = torch.load(pkg_path, map_location=device, weights_only=False)
 
     X_product = pkg["X_product"]          # [T, N_prod, F_in_prod]
     days = pkg["days"]                    # tensor [T]
@@ -246,11 +459,24 @@ def export_hetero5_embeddings_for_config(
     for nt in node_types:
         in_channels_dict[nt] = F_in
 
+    # encoder checkpoint
+    enc_path = (
+        GNN_TRAINED_DIR
+        / f"hetero5_encoder_h{horizon}_lag{lag_window}_{temporal_type}_{mode_name}_seed{seed}.pt"
+    )
+    if not enc_path.exists():
+        print(f"[EXPORT-HET5] encoder checkpoint not found: {enc_path}, skip.")
+        return
+
+    print(f"[EXPORT-HET5] Loading trained encoder from {enc_path}")
+    enc_pkg = torch.load(enc_path, map_location=device, weights_only=False)
+
     encoder = HeterogeneousGINEncoder(
         in_channels_dict=in_channels_dict,
-        hidden_channels=128,
+        hidden_channels=96,
         num_layers=2,
     ).to(device)
+    encoder.load_state_dict(enc_pkg["encoder_state_dict"])
     encoder.eval()
 
     T, N_prod, _ = X_product.shape
@@ -271,7 +497,12 @@ def export_hetero5_embeddings_for_config(
             for nt in x_dict:
                 x_dict[nt] = x_dict[nt].to(device)
 
-            h_prod = encoder(x_dict, edge_index_dict)   # [N_prod, hidden]
+            # edge_index_dict đã ở đúng device? nếu chưa:
+            edge_index_dict_device = {
+                k: v.to(device) for k, v in edge_index_dict.items()
+            }
+
+            h_prod = encoder(x_dict, edge_index_dict_device)   # [N_prod, hidden]
             h_np = h_prod.cpu().numpy()
             day_t = int(days[t])
             split_t = split[t]
@@ -289,274 +520,83 @@ def export_hetero5_embeddings_for_config(
                 )
 
     df_emb = pd.DataFrame(rows)
-    out_path = EMB_DIR / f"gnn_hetero5_emb_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
+    out_path = (
+        EMB_DIR
+        / f"gnn_hetero5_emb_h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}_{mode_name}.parquet"
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df_emb.to_parquet(out_path, index=False)
     print(f"[EXPORT-HET5] Saved hetero5 embeddings to {out_path}")
 
 
-# ============================================================
-# 2. BUILD XGB TABULAR + EMBEDDING
-# ============================================================
-
-def build_xgb_tabular_with_gnn_embed_projected(
-    temporal_type: str,
-    lag_window: int,
-    horizon: int,
-):
-    """
-    base_full_{temporal_type}.parquet + 4-view projected embeddings
-    → concat embedding theo feature: emb_same_group_*, emb_same_subgroup_*, ...
-    """
-    base_full_path = (
-        PROC_DIR
-        / "baseline"
-        / "xgboost"
-        / f"xgboost_tabular_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
-    )
-    emb_path = (
-        EMB_DIR
-        / f"gnn_projected_emb_4views_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
-    )
-
-    if not base_full_path.exists():
-        print(f"[XGB-GNN-EMB-PROJ] base_full not found: {base_full_path}, skip.")
-        return
-    if not emb_path.exists():
-        print(f"[XGB-GNN-EMB-PROJ] embedding (4 views) not found: {emb_path}, skip.")
-        return
-
-    df_base = pd.read_parquet(base_full_path)
-    df_emb_long = pd.read_parquet(emb_path)
-
-    # node_index_pos chính là vị trí trong tensor; mapping pos -> node_index
-    # giả sử node_index_product là sorted và align với pos. Nếu anh đã lưu
-    # node_index_product trong pkg thì ở bước export có thể join để có node_index luôn.
-    df_emb_long = df_emb_long.rename(columns={"node_index_pos": "node_index"})
-    df_emb_long["node_index"] = df_emb_long["node_index"].astype(int)
-
-    # Pivot theo view: mỗi view trở thành 1 nhóm cột emb_{view}_{k}
-    emb_cols = [c for c in df_emb_long.columns if c.startswith("emb_")]
-
-    # tách phần index
-    key_cols = ["node_index", "day", "split", "view"]
-    df_pivot_src = df_emb_long[key_cols + emb_cols].copy()
-
-    # MultiIndex pivot: index=(node_index, day, split), columns=(view, emb_k)
-    df_pivot = (
-        df_pivot_src
-        .set_index(["node_index", "day", "split", "view"])
-        .unstack("view")
-    )
-
-    # flatten MultiIndex columns → emb_{view}_{k}
-    df_pivot.columns = [
-        f"{col_emb}_{view}"
-        for col_emb, view in df_pivot.columns.to_flat_index()
-    ]
-    df_pivot = df_pivot.reset_index()
-
-    # Merge với base_full
-    df = df_base.merge(
-        df_pivot,
-        on=["node_index", "day", "split"],
-        how="inner",
-    )
-
-    feature_cols = [
-        c
-        for c in df.columns
-        if (
-            "lag" in c
-            or "roll" in c
-            or c in ["day_of_week", "is_weekend", "month", "day_of_month"]
-            or c in ["group", "sub_group", "plant", "storage_location"]
-            or c.startswith("emb_")
-        )
-    ]
-    base_cols = ["node_id", "node_index", "date", "day", "split"]
-    df_out = df[base_cols + feature_cols + ["target"]]
-
-    out_path = (
-        XGB_GNN_EMBED_DIR
-        / f"xgboost_tabular_gnnembed_projected4view_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
-    )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df_out.to_parquet(out_path, index=False)
-    print(
-        f"[XGB-GNN-EMB-PROJ] Saved XGB+GNN-embed (4 views concat) tabular to {out_path}"
-    )
-
-def build_xgb_tabular_with_gnn_embed_homo5(
-    temporal_type: str,
-    lag_window: int,
-    horizon: int,           # <-- thêm
-
-):
-    base_full_path = (
-        PROC_DIR
-        / "baseline"
-        / "xgboost"
-        / f"xgboost_tabular_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
-    )
-    emb_path = EMB_DIR / f"gnn_homo5_emb_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
-
-    if not base_full_path.exists():
-        print(f"[XGB-GNN-EMB-HOMO5] base_full not found: {base_full_path}, skip.")
-        return
-    if not emb_path.exists():
-        print(f"[XGB-GNN-EMB-HOMO5] embedding not found: {emb_path}, skip.")
-        return
-
-    df_base = pd.read_parquet(base_full_path)
-    df_emb = pd.read_parquet(emb_path)
-
-    df_emb = df_emb.rename(columns={"node_index_pos": "node_index"})
-    df_emb["node_index"] = df_emb["node_index"].astype(int)
-
-    df = df_base.merge(
-        df_emb,
-        on=["node_index", "day", "split"],
-        how="inner",
-    )
-
-    feature_cols = [
-        c
-        for c in df.columns
-        if (
-            "lag" in c
-            or "roll" in c
-            or c in ["day_of_week", "is_weekend", "month", "day_of_month"]
-            or c in ["group", "sub_group", "plant", "storage_location"]
-            or c.startswith("emb_")
-        )
-    ]
-    base_cols = ["node_id", "node_index", "date", "day", "split"]
-    df_out = df[base_cols + feature_cols + ["target"]]
-
-    out_path = (
-        XGB_GNN_EMBED_DIR
-        / f"xgboost_tabular_gnnembed_homo5_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
-    )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df_out.to_parquet(out_path, index=False)
-    print(
-        f"[XGB-GNN-EMB-HOMO5] Saved XGB+GNN-embed tabular to {out_path}"
-    )
-
-
-def build_xgb_tabular_with_gnn_embed_hetero5(
-    temporal_type: str,
-    lag_window: int,
-    horizon: int,           # <-- thêm
-):
-    base_full_path = (
-        PROC_DIR
-        / "baseline"
-        / "xgboost"
-        / f"xgboost_tabular_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
-    )
-    emb_path = EMB_DIR / f"gnn_hetero5_emb_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
-
-    if not base_full_path.exists():
-        print(f"[XGB-GNN-EMB-HET5] base_full not found: {base_full_path}, skip.")
-        return
-    if not emb_path.exists():
-        print(f"[XGB-GNN-EMB-HET5] embedding not found: {emb_path}, skip.")
-        return
-
-    df_base = pd.read_parquet(base_full_path)
-    df_emb = pd.read_parquet(emb_path)
-
-    df_emb = df_emb.rename(columns={"node_index_pos": "node_index"})
-    df_emb["node_index"] = df_emb["node_index"].astype(int)
-
-    df = df_base.merge(
-        df_emb,
-        on=["node_index", "day", "split"],
-        how="inner",
-    )
-
-    feature_cols = [
-        c
-        for c in df.columns
-        if (
-            "lag" in c
-            or "roll" in c
-            or c in ["day_of_week", "is_weekend", "month", "day_of_month"]
-            or c in ["group", "sub_group", "plant", "storage_location"]
-            or c.startswith("emb_")
-        )
-    ]
-    base_cols = ["node_id", "node_index", "date", "day", "split"]
-    df_out = df[base_cols + feature_cols + ["target"]]
-
-    out_path = (
-        XGB_GNN_EMBED_DIR
-        / f"xgboost_tabular_gnnembed_hetero5_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
-    )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df_out.to_parquet(out_path, index=False)
-    print(
-        f"[XGB-GNN-EMB-HET5] Saved XGB+GNN-embed tabular to {out_path}"
-    )
-
-
-# ============================================================
-# 3. MAIN: FULL CHO TẤT CẢ BIẾN THỂ
-# ============================================================
-
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    seeds = [0, 1, 2]
+    mode_name = "raw"
 
-    for temporal_type in TEMPORAL_TYPES:
-        for horizon in HORIZONS:              # <-- thêm loop horizon
-            for lag_window in LAG_WINDOWS:
-                print(
-                    f"\n=== EXPORT GNN EMBEDDINGS + BUILD XGB DATASET "
-                    f"H{horizon}, lag={lag_window}, temporal_type={temporal_type} ==="
-                )
+    for exp in DEFAULT_EXPERIMENTS:
+        t_type = exp.temporal_type
+        for H in exp.horizons:
+            for L in exp.lag_windows:
+                for seed in seeds:
+                    print(
+                        f"\n=== EXPORT EMBEDDINGS + BUILD XGB+GNNEMB "
+                        f"H{H}, lag={L}, temporal={t_type}, seed={seed} ==="
+                    )
 
-                # 1) Export embeddings cho 3 graph modes
-                export_projected_embeddings_for_config(
-                    temporal_type=temporal_type,
-                    lag_window=lag_window,
-                    horizon=horizon,          # <-- truyền
-                    device=device,
-                )
-                export_homo5_embeddings_for_config(
-                    temporal_type=temporal_type,
-                    lag_window=lag_window,
-                    horizon=horizon,          # <-- truyền
-                    device=device,
-                )
-                export_hetero5_embeddings_for_config(
-                    temporal_type=temporal_type,
-                    lag_window=lag_window,
-                    horizon=horizon,          # <-- truyền
-                    device=device,
-                )
+                    # 1) Export embeddings
+                    export_projected_embeddings_for_config(
+                        temporal_type=t_type,
+                        lag_window=L,
+                        horizon=H,
+                        device=device,
+                        seed=seed,
+                        mode_name=mode_name,
+                    )
+                    export_homo5_embeddings_for_config(
+                        temporal_type=t_type,
+                        lag_window=L,
+                        horizon=H,
+                        device=device,
+                        seed=seed,
+                        mode_name=mode_name,
+                    )
+                    export_hetero5_embeddings_for_config(
+                        temporal_type=t_type,
+                        lag_window=L,
+                        horizon=H,
+                        device=device,
+                        seed=seed,
+                        mode_name=mode_name,
+                    )
 
-                # 2) Build XGB tabular + embedding
-                build_xgb_tabular_with_gnn_embed_projected(
-                    temporal_type=temporal_type,
-                    lag_window=lag_window,
-                    horizon=horizon,          # <-- truyền
-                )
-                build_xgb_tabular_with_gnn_embed_homo5(
-                    temporal_type=temporal_type,
-                    lag_window=lag_window,
-                    horizon=horizon,          # <-- truyền
-                )
-                build_xgb_tabular_with_gnn_embed_hetero5(
-                    temporal_type=temporal_type,
-                    lag_window=lag_window,
-                    horizon=horizon,          # <-- truyền
-                )
+                    # 2) Build tabular+embedding
+                    build_xgb_tabular_gnnembed_projected4view(
+                        horizon=H,
+                        lag_window=L,
+                        temporal_type=t_type,
+                        seed=seed,
+                        mode_name=mode_name,
+                    )
+                    build_xgb_tabular_gnnembed_homo_or_hetero(
+                        horizon=H,
+                        lag_window=L,
+                        temporal_type=t_type,
+                        seed=seed,
+                        mode_name=mode_name,
+                        graph_type="homo5",
+                    )
+                    build_xgb_tabular_gnnembed_homo_or_hetero(
+                        horizon=H,
+                        lag_window=L,
+                        temporal_type=t_type,
+                        seed=seed,
+                        mode_name=mode_name,
+                        graph_type="hetero5",
+                    )
 
-    print(
-        "\n[export_gnn_embeddings] Done exporting all embeddings and building all XGB datasets."
-    )
+    print("\n[export_and_build_xgb_gnnembed] Done.")
+
 
 if __name__ == "__main__":
     main()

@@ -10,8 +10,10 @@ from config.config import PROC_DIR, DEFAULT_EXPERIMENTS
 
 
 RUN_SUMMARY: list[dict] = []
-
-
+import random
+def set_global_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
 # =========================
 # Metrics
 # =========================
@@ -133,18 +135,24 @@ def train_xgb_tabular_graphfeat(
     temporal_type: str,
     lag_window: int,
     graph_type: str,
+    seed: int = 42,
 ) -> None:
     """
     graph_type: 'projected' | 'homo5' | 'hetero5'
     """
     target_type = "raw"
-    tag = f"xgb_tabular_graphfeat_{graph_type}_h{horizon}_lag{lag_window}_{temporal_type}"
+    tag = (
+        f"xgb_tabular_graphfeat_{graph_type}_h{horizon}_lag{lag_window}_"
+        f"{temporal_type}_seed{seed}"
+    )
+
+    set_global_seed(seed)  # <--- cố định RNG cho run này
 
     print(
         f"\n=== Training XGBoost TABULAR + {graph_type} graph features "
-        f"(H{horizon}, lag={lag_window}, temporal_type={temporal_type}, target_type={target_type}) ==="
+        f"(H{horizon}, lag={lag_window}, temporal_type={temporal_type}, "
+        f"target_type={target_type}, seed={seed}) ==="
     )
-
     # 1) Load tabular + graph features
     df_base = load_tabular_graphfeat(
         horizon=horizon,
@@ -188,7 +196,7 @@ def train_xgb_tabular_graphfeat(
         colsample_bytree=0.8,
         objective="reg:squarederror",
         tree_method="hist",
-        random_state=42,
+        random_state=seed,
         n_jobs=-1,
         eval_metric="rmse",
         early_stopping_rounds=100,
@@ -297,7 +305,11 @@ def train_xgb_tabular_graphfeat(
             "y_pred": y_test_pred,
         }
     )
-    out_pred_file = out_dir_csv / f"xgb_tabular_graphfeat_{graph_type}_h{horizon}_lag{lag_window}_{temporal_type}_test_predictions.csv"
+    out_pred_file = (
+        out_dir_csv
+        / f"xgb_tabular_graphfeat_{graph_type}_h{horizon}_lag{lag_window}_"
+          f"{temporal_type}_test_predictions_seed{seed}.csv"
+    )
     df_test_pred.to_csv(out_pred_file, index=False)
     print(f"Saved test predictions to {out_pred_file}")
 
@@ -319,6 +331,7 @@ def train_xgb_tabular_graphfeat(
             "temporal_type": temporal_type,
             "lag_window": lag_window,
             "horizon": horizon,
+            "seed": seed,
             "graph_type": graph_type,
             "variant": f"xgb_tabular_graphfeat_{graph_type}_{target_type}",
             "tag": tag,
@@ -349,6 +362,7 @@ def main():
     RUN_SUMMARY = []
 
     graph_types = ["projected", "homo5", "hetero5"]
+    seeds = [0, 1, 2]  # ví dụ 3 seed
 
     for exp in DEFAULT_EXPERIMENTS:
         temporal_type = exp.temporal_type
@@ -356,8 +370,6 @@ def main():
         if not horizons:
             continue
 
-        # nên lấy lag_windows giống các script khác: exp.lag_windows
-        # nếu bạn cố ý dùng gru_seq_lengths ở đây thì giữ nguyên
         lag_windows = list(getattr(exp, "lag_windows", exp.gru_seq_lengths))
 
         print(
@@ -365,27 +377,29 @@ def main():
             f"H={horizons}, lags={lag_windows} ======"
         )
 
-        for horizon in horizons:              # <-- loop tất cả horizon
+        for horizon in horizons:
             for lag_window in lag_windows:
                 for gtype in graph_types:
-                    try:
-                        train_xgb_tabular_graphfeat(
-                            horizon=horizon,
-                            temporal_type=temporal_type,
-                            lag_window=lag_window,
-                            graph_type=gtype,
-                        )
-                    except FileNotFoundError:
-                        print(
-                            f"[WARN] File for {gtype}, H{horizon}, "
-                            f"lag{lag_window}, {temporal_type} không tồn tại, skip."
-                        )
+                    for seed in seeds:
+                        try:
+                            train_xgb_tabular_graphfeat(
+                                horizon=horizon,
+                                temporal_type=temporal_type,
+                                lag_window=lag_window,
+                                graph_type=gtype,
+                                seed=seed,
+                            )
+                        except FileNotFoundError:
+                            print(
+                                f"[WARN] File for {gtype}, H{horizon}, "
+                                f"lag{lag_window}, {temporal_type} không tồn tại, skip."
+                            )
 
     if RUN_SUMMARY:
         df_sum = pd.DataFrame(RUN_SUMMARY)
-        print("\n=== XGB Tabular + Graph Features summary ===")
+        print("\n=== XGB Tabular + Graph Features summary with seeds ===")
         df_sum = df_sum.sort_values(
-            ["temporal_type", "graph_type", "lag_window", "horizon"]
+            ["temporal_type", "graph_type", "lag_window", "horizon", "seed"]
         )
         print(
             df_sum[
@@ -394,6 +408,7 @@ def main():
                     "graph_type",
                     "lag_window",
                     "horizon",
+                    "seed",
                     "n_features",
                     "MAE_train",
                     "RMSE_train",
@@ -409,11 +424,10 @@ def main():
             PROC_DIR
             / "predictions"
             / "baseline_7"
-            / "summary_xgb_tabular_graphfeat_raw_targets.csv"
+            / "summary_xgb_tabular_graphfeat_raw_targets_with_seeds.csv"
         )
         out_path.parent.mkdir(parents=True, exist_ok=True)
         df_sum.to_csv(out_path, index=False)
-        print(f"\nSaved XGB + graph features summary to {out_path}")
-
+        print(f"\nSaved XGB + graph features summary (with seeds) to {out_path}")
 if __name__ == "__main__":
     main()

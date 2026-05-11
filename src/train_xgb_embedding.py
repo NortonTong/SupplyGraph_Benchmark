@@ -13,7 +13,6 @@ pd.set_option("display.width", 0)
 
 RUN_SUMMARY: list[dict] = []
 
-
 # =========================
 # Experiment params (multi-horizon)
 # =========================
@@ -24,10 +23,8 @@ def get_experiment_params():
     lag_windows = sorted({L for exp in DEFAULT_EXPERIMENTS for L in exp.lag_windows})
     return temporal_types, horizons, lag_windows
 
-
 TEMPORAL_TYPES, HORIZONS, LAG_WINDOWS = get_experiment_params()
 GRAPH_MODES: list[Literal["proj", "homo", "hetero"]] = ["proj", "homo", "hetero"]
-
 
 # =========================
 # Metrics
@@ -41,13 +38,11 @@ def mape(y_true, y_pred, eps=1e-8):
         return np.nan
     return float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100.0)
 
-
 def smape(y_true, y_pred, eps=1e-8):
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
     denom = (np.abs(y_true) + np.abs(y_pred)) + eps
     return float(np.mean(2.0 * np.abs(y_pred - y_true) / denom) * 100.0)
-
 
 # =========================
 # Load tabular + GNN embedding baseline
@@ -58,28 +53,37 @@ def load_tabular_gnn_embed_baseline(
     temporal_type: str = "unit",
     lag_window: int = 7,
     graph_mode: Literal["proj", "homo", "hetero"] = "proj",
+    seed: int = 0,
 ) -> pd.DataFrame:
     """
     Đọc file parquet đã merge base_full_unit + GNN embeddings.
-    Ví dụ path:
+    Ví dụ:
       data/processed/baseline/xgb_gnn_embed/
-        xgboost_tabular_gnnembed_{graph_mode}_h{H}_lag{L}_{temporal_type}.parquet
+        xgboost_tabular_gnnembed_{graph_mode}_h{H}_lag{L}_{temporal_type}_seed{seed}.parquet
     """
     base_dir = PROC_DIR / "baseline" / "xgb_gnn_embed"
 
     if graph_mode == "proj":
-        fname = f"xgboost_tabular_gnnembed_projected4view_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
+        fname = (
+            f"xgboost_tabular_gnnembed_projected4view_"
+            f"h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}.parquet"
+        )
     elif graph_mode == "homo":
-        fname = f"xgboost_tabular_gnnembed_homo5_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
+        fname = (
+            f"xgboost_tabular_gnnembed_homo5_"
+            f"h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}.parquet"
+        )
     elif graph_mode == "hetero":
-        fname = f"xgboost_tabular_gnnembed_hetero5_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
+        fname = (
+            f"xgboost_tabular_gnnembed_hetero5_"
+            f"h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}.parquet"
+        )
     else:
         raise ValueError(f"Unknown graph_mode={graph_mode}")
 
     path = base_dir / fname
     print(f"[Baseline5] Loading XGB + GNN embedding tabular from {path}")
     return pd.read_parquet(path)
-
 
 # =========================
 # Features
@@ -90,7 +94,6 @@ def split_train_val_test(df: pd.DataFrame):
     df_val = df[df["split"] == "val"].copy()
     df_test = df[df["split"] == "test"].copy()
     return df_train, df_val, df_test
-
 
 def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     target = df["target"].astype(float)
@@ -105,7 +108,6 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     feature_cols = [c for c in df.columns if c not in drop_cols]
     X = df[feature_cols].copy()
     return X, target
-
 
 # =========================
 # Plot predictions (per product)
@@ -145,7 +147,8 @@ def plot_predictions_per_product(
         plt.plot(sub["date"], sub["y_true"], label="True", marker="o", linewidth=1)
         plt.plot(sub["date"], sub["y_pred"], label="Pred", marker="x", linewidth=1)
         plt.title(
-            f"Baseline 5 - XGB + GNN Embedding ({graph_mode}, H={horizon}, lag={lag_window}, {temporal_type}) - node_id={node}"
+            f"Baseline 5 - XGB + GNN Embedding ({graph_mode}, H={horizon}, "
+            f"lag={lag_window}, {temporal_type}) - node_id={node}"
         )
         plt.xlabel("Date")
         plt.ylabel("Sales order")
@@ -159,7 +162,6 @@ def plot_predictions_per_product(
         plt.savefig(fname, dpi=150)
         plt.close()
 
-
 # =========================
 # Train 1 cấu hình
 # =========================
@@ -170,13 +172,14 @@ def train_xgb_gnn_embed_baseline(
     lag_window: int = 7,
     graph_mode: Literal["proj", "homo", "hetero"] = "proj",
     tag: str | None = None,
+    seed: int = 0,
 ) -> None:
     target_type = "raw"  # dùng target raw, align với baseline 1,3 & GRU
 
     if tag is None:
         tag = (
             f"baseline5_xgb_gnn_embed_{graph_mode}_{target_type}"
-            f"_h{horizon}_lag{lag_window}_{temporal_type}"
+            f"_h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}"
         )
 
     print(
@@ -191,6 +194,7 @@ def train_xgb_gnn_embed_baseline(
         temporal_type=temporal_type,
         lag_window=lag_window,
         graph_mode=graph_mode,
+        seed=seed,
     )
     df_base["node_id"] = df_base["node_id"].astype(str)
 
@@ -211,7 +215,8 @@ def train_xgb_gnn_embed_baseline(
 
     feature_names = list(X_train.columns)
     print(
-        f"\n[H{horizon}][lag{lag_window}][{tag}] Using {len(feature_names)} features (tabular + gnn_embed):"
+        f"\n[H{horizon}][lag{lag_window}][{tag}] Using {len(feature_names)} "
+        f"features (tabular + gnn_embed):"
     )
     print(feature_names)
     print(f"Train samples: {X_train.shape[0]}")
@@ -227,12 +232,11 @@ def train_xgb_gnn_embed_baseline(
         colsample_bytree=0.8,
         objective="reg:squarederror",
         tree_method="hist",
-        random_state=42,
+        random_state=seed,   # seed ảnh hưởng XGB; embedding đã encode theo seed này
         n_jobs=-1,
         eval_metric="rmse",
         early_stopping_rounds=100,
     )
-
     eval_set = [(X_train, y_train), (X_val, y_val)]
 
     model.fit(
@@ -323,6 +327,7 @@ def train_xgb_gnn_embed_baseline(
             "graph_mode": graph_mode,
             "lag_window": lag_window,
             "horizon": horizon,
+            "seed": seed,
             "variant": f"baseline_5_xgb_gnn_embed_{graph_mode}_{target_type}",
             "tag": tag,
             "target_type": target_type,
@@ -362,7 +367,8 @@ def train_xgb_gnn_embed_baseline(
     )
     out_pred_file = (
         out_dir_csv
-        / f"xgb_gnn_embed_{graph_mode}_h{horizon}_lag{lag_window}_{target_type}_test_predictions_{temporal_type}.csv"
+        / f"xgb_gnn_embed_{graph_mode}_h{horizon}_lag{lag_window}_{target_type}"
+        f"_test_predictions_{temporal_type}_seed{seed}.csv"
     )
     df_test_pred.to_csv(out_pred_file, index=False)
     print(f"\nSaved test predictions to {out_pred_file}")
@@ -380,7 +386,6 @@ def train_xgb_gnn_embed_baseline(
     )
     print(f"Saved per-product prediction plots to {out_dir_plot}")
 
-
 # =========================
 # Main: run all configs
 # =========================
@@ -389,20 +394,25 @@ def main():
     global RUN_SUMMARY
     RUN_SUMMARY = []
 
+    seeds = [0, 1, 2]  # chạy nhiều seed để aggregate mean/std sau
+
     for temporal_type in TEMPORAL_TYPES:
         for horizon in HORIZONS:
             for lag_window in LAG_WINDOWS:
                 for graph_mode in GRAPH_MODES:
-                    train_xgb_gnn_embed_baseline(
-                        horizon=horizon,
-                        temporal_type=temporal_type,
-                        lag_window=lag_window,
-                        graph_mode=graph_mode,
-                        tag=(
+                    for seed in seeds:
+                        tag = (
                             f"baseline5_xgb_gnn_embed_{graph_mode}_raw_"
-                            f"h{horizon}_lag{lag_window}_{temporal_type}"
-                        ),
-                    )
+                            f"h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}"
+                        )
+                        train_xgb_gnn_embed_baseline(
+                            horizon=horizon,
+                            temporal_type=temporal_type,
+                            lag_window=lag_window,
+                            graph_mode=graph_mode,
+                            seed=seed,
+                            tag=tag,
+                        )
 
     if RUN_SUMMARY:
         df_sum = pd.DataFrame(RUN_SUMMARY)
@@ -414,6 +424,7 @@ def main():
                 "lag_window",
                 "horizon",
                 "target_type",
+                "seed",
                 "tag",
             ]
         )
@@ -424,6 +435,7 @@ def main():
                     "graph_mode",
                     "lag_window",
                     "horizon",
+                    "seed",
                     "target_type",
                     "tag",
                     "n_features",
@@ -446,7 +458,6 @@ def main():
         out_path.parent.mkdir(parents=True, exist_ok=True)
         df_sum.to_csv(out_path, index=False)
         print(f"\nSaved baseline 5 summary to {out_path}")
-
 
 if __name__ == "__main__":
     main()

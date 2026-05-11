@@ -1,0 +1,67 @@
+horizon,lag_window,seed,zero_bucket,model,MAE,n_samples
+14,7,1,high_zero,XGB,60.44924045698925,372
+14,7,1,high_zero,XGB+Graph proj,28.918401564516135,372
+14,7,1,high_zero,XGB+Graph homo,15.800900782258063,372
+14,7,1,high_zero,XGB+Graph hetero,17.258744927419357,372
+14,7,1,high_zero,GNN proj same_group,450.7980277890645,372
+14,7,1,high_zero,GNN proj same_plant,535.9749812580645,372
+14,7,1,high_zero,GNN proj same_storage,717.8825742193549,372
+14,7,1,high_zero,GNN proj same_subgroup,8.999799321102149,372
+14,7,1,high_zero,GNN homo5,2.21586389983871,372
+14,7,1,high_zero,GNN hetero5,12.258706829758065,372
+14,7,1,high_zero,XGB + GNN embed proj,91.84485216666664,372
+14,7,1,high_zero,XGB + GNN embed homo,14.100437686559138,372
+14,7,1,high_zero,XGB + GNN embed hetero,111.44023333333332,372
+14,7,1,high_zero,XGB + graphfeat proj,9.970276567876343,372
+14,7,1,high_zero,XGB + graphfeat homo,15.00954320967742,372
+14,7,1,high_zero,XGB + graphfeat hetero,5.308740469811828,372
+14,7,1,high_zero,Residual GNN proj same_group,167.9579244247312,372
+14,7,1,high_zero,Residual GNN proj same_plant,114.75538396962365,372
+14,7,1,high_zero,Residual GNN proj same_storage,110.67262542876344,372
+14,7,1,high_zero,Residual GNN proj same_subgroup,36.90752173817204,372
+14,7,1,high_zero,Residual GNN homo5,21.590005059139784,372
+14,7,1,high_zero,Residual GNN hetero5,37.950045436827956,372
+14,7,1,mid_zero,XGB,79.29430453514104,186
+14,7,1,mid_zero,XGB+Graph proj,63.590117594280805,186
+14,7,1,mid_zero,XGB+Graph homo,54.154294895535294,186
+14,7,1,mid_zero,XGB+Graph hetero,54.52896107564281,186
+14,7,1,mid_zero,GNN proj same_group,457.24869272528434,186
+14,7,1,mid_zero,GNN proj same_plant,378.8730232125604,186
+14,7,1,mid_zero,GNN proj same_storage,882.8048099146797,186
+14,7,1,mid_zero,GNN proj same_subgroup,60.63143531423172,186
+14,7,1,mid_zero,GNN homo5,196.0025548726679,186
+14,7,1,mid_zero,GNN hetero5,71.45000275988232,186
+14,7,1,mid_zero,XGB + GNN embed proj,103.94878051901199,186
+14,7,1,mid_zero,XGB + GNN embed homo,63.427213732094444,186
+14,7,1,mid_zero,XGB + GNN embed hetero,115.77244475019481,186
+14,7,1,mid_zero,XGB + graphfeat proj,56.20854601885071,186
+14,7,1,mid_zero,XGB + graphfeat homo,55.25365081256038,186
+14,7,1,mid_zero,XGB + graphfeat hetero,54.21693456659265,186
+14,7,1,mid_zero,Residual GNN proj same_group,190.510759149626,186
+14,7,1,mid_zero,Residual GNN proj same_plant,119.96894178051735,186
+14,7,1,mid_zero,Residual GNN proj same_storage,168.89756142184822,186
+14,7,1,mid_zero,Residual GNN proj same_subgroup,81.62397562116253,186
+14,7,1,mid_zero,Residual GNN homo5,81.1117298738507,186
+14,7,1,mid_zero,Residual GNN hetero5,110.43459884159263,186
+14,7,1,low_zero,XGB,607.138572653456,682
+14,7,1,low_zero,XGB+Graph proj,630.0173823791712,682
+14,7,1,low_zero,XGB+Graph homo,640.6396491914219,682
+14,7,1,low_zero,XGB+Graph hetero,633.4304141695,682
+14,7,1,low_zero,GNN proj same_group,1224.987594099633,682
+14,7,1,low_zero,GNN proj same_plant,1286.8187722729467,682
+14,7,1,low_zero,GNN proj same_storage,1572.80866730325,682
+14,7,1,low_zero,GNN proj same_subgroup,1224.6449850836232,682
+14,7,1,low_zero,GNN homo5,1036.6796174343674,682
+14,7,1,low_zero,GNN hetero5,744.5915370407662,682
+14,7,1,low_zero,XGB + GNN embed proj,703.5618962832747,682
+14,7,1,low_zero,XGB + GNN embed homo,692.1589704888655,682
+14,7,1,low_zero,XGB + GNN embed hetero,793.0579203098375,682
+14,7,1,low_zero,XGB + graphfeat proj,603.7582383075998,682
+14,7,1,low_zero,XGB + graphfeat homo,610.0880465295597,682
+14,7,1,low_zero,XGB + graphfeat hetero,618.4554616886847,682
+14,7,1,low_zero,Residual GNN proj same_group,636.6324842271098,682
+14,7,1,low_zero,Residual GNN proj same_plant,622.6221400436319,682
+14,7,1,low_zero,Residual GNN proj same_storage,687.9173750956516,682
+14,7,1,low_zero,Residual GNN proj same_subgroup,656.2404082153265,682
+14,7,1,low_zero,Residual GNN homo5,658.8481706230042,682
+14,7,1,low_zero,Residual GNN hetero5,682.8502916371782,682

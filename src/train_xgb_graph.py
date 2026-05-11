@@ -12,8 +12,10 @@ pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 0)
 
 RUN_SUMMARY: list[dict] = []
-
-
+import random
+def set_global_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
 # =========================
 # Lấy tham số từ DEFAULT_EXPERIMENTS
 # =========================
@@ -164,20 +166,24 @@ def train_xgb_graph_baseline(
     horizon: int = 7,
     graph_mode: Literal["proj", "homo", "hetero"] = "proj",
     tag: str | None = None,
+    seed: int = 42,
 ) -> None:
     target_type = "raw"  # baseline 3: dùng target raw, align với baseline 1 & GRU
 
     if tag is None:
-        tag = (
-            f"baseline3_xgb_graph_{graph_mode}_{target_type}"
-            f"_h{horizon}_lag{lag_window}_{temporal_type}"
-        )
+            tag = (
+                f"baseline3_xgb_graph_{graph_mode}_{target_type}"
+                f"_h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}"
+            )
+
+    set_global_seed(seed)  # <--- cố định RNG cho run này
 
     print(
-        f"\n=== Training XGBoost GRAPH baseline (Baseline 3) "
-        f"H{horizon}, lag={lag_window}, temporal_type={temporal_type}, "
-        f"graph_mode={graph_mode}, target_type={target_type}, tag={tag} ==="
-    )
+            f"\n=== Training XGBoost GRAPH baseline (Baseline 3) "
+            f"H{horizon}, lag={lag_window}, temporal_type={temporal_type}, "
+            f"graph_mode={graph_mode}, target_type={target_type}, tag={tag}, seed={seed} ==="
+        )
+
 
     # 1) Load tabular + graph baseline (precomputed)
     df_base = load_tabular_graph_baseline(
@@ -221,7 +227,7 @@ def train_xgb_graph_baseline(
         colsample_bytree=0.8,
         objective="reg:squarederror",
         tree_method="hist",
-        random_state=42,
+        random_state=seed,
         n_jobs=-1,
         eval_metric="rmse",
         early_stopping_rounds=100,
@@ -317,6 +323,7 @@ def train_xgb_graph_baseline(
             "graph_mode": graph_mode,
             "lag_window": lag_window,
             "horizon": horizon,
+            "seed": seed,
             "variant": f"baseline_3_xgb_graph_{graph_mode}_{target_type}",
             "tag": tag,
             "target_type": target_type,
@@ -356,7 +363,8 @@ def train_xgb_graph_baseline(
     )
     out_pred_file = (
         out_dir_csv
-        / f"xgb_graph_{graph_mode}_h{horizon}_lag{lag_window}_{target_type}_test_predictions_{temporal_type}.csv"
+        / f"xgb_graph_{graph_mode}_h{horizon}_lag{lag_window}_{target_type}_"
+          f"test_predictions_{temporal_type}_seed{seed}.csv"
     )
     df_test_pred.to_csv(out_pred_file, index=False)
     print(f"\nSaved test predictions to {out_pred_file}")
@@ -383,24 +391,28 @@ def main():
     global RUN_SUMMARY
     RUN_SUMMARY = []
 
+    seeds = [0, 1, 2]  # ví dụ 3 seed
+
     for temporal_type in TEMPORAL_TYPES:
         for horizon in HORIZONS:
             for lag_window in LAG_WINDOWS:
                 for graph_mode in GRAPH_MODES:
-                    train_xgb_graph_baseline(
-                        temporal_type=temporal_type,
-                        lag_window=lag_window,
-                        horizon=horizon,
-                        graph_mode=graph_mode,
-                        tag=(
-                            f"baseline3_xgb_graph_{graph_mode}_raw_"
-                            f"h{horizon}_lag{lag_window}_{temporal_type}"
-                        ),
-                    )
+                    for seed in seeds:
+                        train_xgb_graph_baseline(
+                            temporal_type=temporal_type,
+                            lag_window=lag_window,
+                            horizon=horizon,
+                            graph_mode=graph_mode,
+                            tag=(
+                                f"baseline3_xgb_graph_{graph_mode}_raw_"
+                                f"h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}"
+                            ),
+                            seed=seed,
+                        )
 
     if RUN_SUMMARY:
         df_sum = pd.DataFrame(RUN_SUMMARY)
-        print("\n=== Baseline 3 (XGB + Graph) summary ===")
+        print("\n=== Baseline 3 (XGB + Graph) summary with seeds ===")
         df_sum = df_sum.sort_values(
             [
                 "temporal_type",
@@ -408,6 +420,7 @@ def main():
                 "lag_window",
                 "horizon",
                 "target_type",
+                "seed",   # <-- thêm seed
                 "tag",
             ]
         )
@@ -419,6 +432,7 @@ def main():
                     "lag_window",
                     "horizon",
                     "target_type",
+                    "seed",
                     "tag",
                     "n_features",
                     "MAE_train",
@@ -435,12 +449,11 @@ def main():
             PROC_DIR
             / "predictions"
             / "baseline_3"
-            / "summary_xgb_graph_baseline3_raw_lags_graphmodes_horizons.csv"
+            / "summary_xgb_graph_baseline3_raw_lags_graphmodes_horizons_with_seeds.csv"
         )
         out_path.parent.mkdir(parents=True, exist_ok=True)
         df_sum.to_csv(out_path, index=False)
-        print(f"\nSaved baseline 3 summary to {out_path}")
-
+        print(f"\nSaved baseline 3 summary (with seeds) to {out_path}")
 
 if __name__ == "__main__":
     main()
