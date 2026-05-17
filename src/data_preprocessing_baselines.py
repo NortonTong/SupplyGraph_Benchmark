@@ -388,13 +388,24 @@ def build_xgboost_tabular(
     df_h = df[base_cols + feature_cols + [label_col]].rename(
         columns={label_col: "target"}
     )
-
+    print("df_h columns:", df_h.columns.tolist())
+    print("df_h shape:", df_h.shape)
+    print("target exists:", "target" in df_h.columns)
+    print("target head:", df_h["target"].head().tolist())
+    print("split counts:\n", df_h["split"].value_counts())
     df_ohe = one_hot_encode_splits(df_h, CAT_COLS)
-
+    print("df_ohe columns contains target:", "target" in df_ohe.columns)
+    print("df_ohe shape:", df_ohe.shape)
+    print("df_ohe head target:", df_ohe["target"].head().tolist() if "target" in df_ohe.columns else None)
     out_dir = PROC_DIR / "baseline" / "xgboost"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"xgboost_tabular_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     df_ohe.to_parquet(out_path, index=False)
+    df_check = pd.read_parquet(out_path)
+    print("saved file columns contains target:", "target" in df_check.columns)
+    print("saved file shape:", df_check.shape)
+    if "target" in df_check.columns:
+        print("saved target head:", df_check["target"].head().tolist())
     print(f"Saved XGBoost baseline to {out_path}")
     return df_ohe
 

@@ -1,0 +1,8 @@
+metric,value
+same_shape,False
+same_columns_order,True
+same_columns_set,True
+target_col_1,
+target_col_2,
+target_col_name_equal,True
+rows_after_join_on_node_date,8000
