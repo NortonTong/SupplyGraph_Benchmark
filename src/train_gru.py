@@ -2,15 +2,12 @@ import numpy as np
 import pandas as pd
 from math import sqrt
 from pathlib import Path
-
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 import matplotlib.pyplot as plt
-
 from config.config import PROC_DIR, DEFAULT_EXPERIMENTS
-
 import random
 
 def set_global_seed(seed: int):
@@ -19,9 +16,6 @@ def set_global_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-# ====================== Metrics ======================
-
 
 def mape(y_true, y_pred, eps=1e-8):
     y_true = np.asarray(y_true, dtype=float)
@@ -33,16 +27,11 @@ def mape(y_true, y_pred, eps=1e-8):
         np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100.0
     )
 
-
 def smape(y_true, y_pred, eps=1e-8):
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
     denom = (np.abs(y_true) + np.abs(y_pred)) + eps
     return float(np.mean(2.0 * np.abs(y_pred - y_true) / denom) * 100.0)
-
-
-# ====================== EarlyStopping ======================
-
 
 class EarlyStopping:
     def __init__(self, patience: int = 10, min_delta: float = 0.0):
@@ -53,7 +42,6 @@ class EarlyStopping:
         self.early_stop = False
 
     def step(self, metric: float) -> bool:
-        # metric: val_rmse (càng nhỏ càng tốt)
         score = -metric
 
         if self.best_score is None:
@@ -71,10 +59,6 @@ class EarlyStopping:
             self.counter = 0
 
         return False
-
-
-# ====================== Dataset & Model ======================
-
 
 class GRUDataset(Dataset):
     def __init__(self, X, y):
@@ -98,12 +82,6 @@ class GRURegressor(nn.Module):
         is_softplus: bool = False,
         is_log1p: bool = False,
     ):
-        """
-        - is_softplus=True:  y_hat = softplus(head)        (>= 0, smooth)
-        - is_log1p=True:    head ~ log1p(y), y_hat = expm1(head).clamp_min(0)
-        - cả 2 False:       y_hat = head (raw)
-        Không được bật đồng thời cả 2.
-        """
         super().__init__()
         if is_softplus and is_log1p:
             raise ValueError("Only one of is_softplus / is_log1p can be True.")
@@ -128,10 +106,9 @@ class GRURegressor(nn.Module):
             self.softplus = nn.Softplus()
 
     def forward(self, x):
-        # x: (batch, seq_len, input_size)
-        out, h_n = self.gru(x)        # h_n: (num_layers, batch, hidden)
-        last_hidden = h_n[-1]         # (batch, hidden)
-        head = self.fc(last_hidden).squeeze(-1)  # (batch,)
+        out, h_n = self.gru(x) 
+        last_hidden = h_n[-1]        
+        head = self.fc(last_hidden).squeeze(-1)  
 
         if self.is_softplus:
             y_hat = self.softplus(head)
@@ -142,19 +119,11 @@ class GRURegressor(nn.Module):
 
         return y_hat
 
-
-# ====================== Data utils ======================
-
-
 def load_baseline(
     horizon: int,
     window: int,
     temporal_type: str = "unit",
 ) -> pd.DataFrame:
-    """
-    Dùng GRU base no-graph: baseline/gru/gru_sequence_h{horizon}_L{window}_{temporal_type}.parquet
-    Yêu cầu preprocessing đã build file tương ứng cho từng horizon/window.
-    """
     path = (
         PROC_DIR
         / "baseline"
@@ -172,18 +141,11 @@ def load_baseline(
 
     return df
 
-
 def build_sequences(
     df: pd.DataFrame,
     window: int,
     split: str = "train",
 ):
-    """
-    Tạo sequence (X, y) cho một split (train/val/test):
-    - X: (num_samples, window, num_features)
-    - y: (num_samples,)
-    - meta: DataFrame (num_samples, [node_id, date])
-    """
     df_split = df[df["split"] == split].copy()
     df_split = df_split.sort_values(["node_id", "day"])
 
@@ -227,13 +189,10 @@ def build_sequences(
 
     if not X_list:
         return None, None, feature_cols, None
-
     X = np.stack(X_list, axis=0)
     y = np.asarray(y_list)
     meta = pd.DataFrame(meta_list)
-
     return X, y, feature_cols, meta
-
 
 def make_dataloaders(
     df: pd.DataFrame,
@@ -270,10 +229,6 @@ def make_dataloaders(
         meta_test,
     )
 
-
-# ====================== Plot predictions per product ======================
-
-
 def plot_predictions_per_product_gru(
     df_test: pd.DataFrame,
     out_dir: Path,
@@ -283,10 +238,6 @@ def plot_predictions_per_product_gru(
     transform_tag: str,
     max_plots: int | None = None,
 ) -> None:
-    """
-    Vẽ y_true vs y_pred theo ngày cho từng sản phẩm (node_id) trên test split.
-    Lưu 1 file .png / sản phẩm vào out_dir, prefix gru_baseline2_*.
-    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -319,10 +270,6 @@ def plot_predictions_per_product_gru(
         plt.savefig(fname, dpi=150)
         plt.close()
 
-
-# ====================== Training (fixed split) ======================
-
-
 def train_one_gru(
     horizon: int,
     window: int,
@@ -341,10 +288,6 @@ def train_one_gru(
     is_log1p: bool = False,
     seed: int = 42,
 ):
-    """
-    - is_softplus / is_log1p điều khiển output layer trong GRURegressor.
-    - Loss + metrics luôn tính trên scale output của model.
-    """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     set_global_seed(seed)
@@ -398,7 +341,6 @@ def train_one_gru(
     )
 
     for epoch in range(1, n_epochs + 1):
-        # ---------- Train ----------
         model.train()
         train_losses = []
         train_trues, train_preds = [], []
@@ -436,7 +378,6 @@ def train_one_gru(
             train_mape_val = mape(train_trues, train_preds)
             train_smape_val = smape(train_trues, train_preds)
 
-        # ---------- Validation ----------
         model.eval()
         val_preds, val_trues = [], []
 
@@ -485,7 +426,6 @@ def train_one_gru(
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    # ---------- Test ----------
     model.eval()
     test_preds, test_trues = [], []
     with torch.no_grad():
@@ -522,7 +462,6 @@ def train_one_gru(
         f"MAPE={test_mape_val:.4f}, sMAPE={test_smape_val:.4f}"
     )
 
-    # ===== Lưu model theo folder transform_tag =====
     out_dir_model = PROC_DIR / "models" / "gru" / "baseline_2" / transform_tag
     out_dir_model.mkdir(parents=True, exist_ok=True)
     model_path = out_dir_model / f"gru_baseline2_h{horizon}_w{window}_{temporal_type}_seed{seed}.pth"
@@ -544,7 +483,6 @@ def train_one_gru(
     )
     print(f"Saved GRU model to {model_path}")
 
-    # ===== Lưu test predictions theo folder transform_tag =====
     out_dir_pred = (
         PROC_DIR
         / "predictions"
@@ -561,7 +499,6 @@ def train_one_gru(
     out_pred_file = out_dir_pred / f"gru_baseline2_h{horizon}_w{window}_seed{seed}_test_predictions.csv"
     print(f"Saved GRU test predictions to {out_pred_file}")
 
-    # ===== Lưu plots theo folder transform_tag =====
     plot_dir = (
         PROC_DIR
         / "predictions"
@@ -610,10 +547,6 @@ def train_one_gru(
 
     return model, info
 
-
-# ====================== Orchestration over DEFAULT_EXPERIMENTS ======================
-
-
 def main():
     summaries = []
 
@@ -622,7 +555,7 @@ def main():
     for exp in experiments:
         temporal_type = exp.temporal_type
         horizons = list(exp.horizons)
-        lag_windows = list(exp.gru_seq_lengths)  # dùng gru_seq_lengths làm window
+        lag_windows = list(exp.gru_seq_lengths)  
         is_softplus = exp.is_softplus
         is_log1p = exp.is_log1p
 
@@ -661,7 +594,6 @@ def main():
                         seed = seed,
                     )
 
-                    # đảm bảo info có đủ metadata
                     info["temporal_type"] = temporal_type
                     info["horizon"] = horizon
                     info["window"] = window
@@ -670,7 +602,6 @@ def main():
                     info["seed"] = seed
                     summaries.append(info)
 
-    # Tổng hợp kết quả fixed-split
     if summaries:
         df_sum = pd.DataFrame(summaries)
         df_sum = df_sum.sort_values(

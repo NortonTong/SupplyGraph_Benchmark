@@ -1,22 +1,17 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
-
 from xgboost import XGBRegressor
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error
 import matplotlib.pyplot as plt
-
 from config.config import PROC_DIR, DEFAULT_EXPERIMENTS
-
 
 RUN_SUMMARY: list[dict] = []
 import random
+
 def set_global_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
-# =========================
-# Metrics
-# =========================
 
 def mape(y_true, y_pred, eps=1e-8):
     y_true = np.asarray(y_true, dtype=float)
@@ -26,17 +21,11 @@ def mape(y_true, y_pred, eps=1e-8):
         return np.nan
     return float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100.0)
 
-
 def smape(y_true, y_pred, eps=1e-8):
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
     denom = (np.abs(y_true) + np.abs(y_pred)) + eps
     return float(np.mean(2.0 * np.abs(y_pred - y_true) / denom) * 100.0)
-
-
-# =========================
-# Load tabular with graph features
-# =========================
 
 def load_tabular_graphfeat(
     horizon: int,
@@ -44,24 +33,17 @@ def load_tabular_graphfeat(
     lag_window: int,
     graph_type: str,
 ) -> pd.DataFrame:
-    """
-    graph_type in {"projected", "homo5", "hetero5"}.
 
-    Tương ứng file:
-    xgboost_tabular_graphfeat_{graph_type}_h{H}_lag{L}_{temporal_type}.parquet
-    """
     fname = f"xgboost_tabular_graphfeat_{graph_type}_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     path = PROC_DIR / "baseline" / "xgboost" / fname
     print(f"Loading tabular + graph features from {path}")
     return pd.read_parquet(path)
-
 
 def split_train_val_test(df: pd.DataFrame):
     df_train = df[df["split"] == "train"].copy()
     df_val   = df[df["split"] == "val"].copy()
     df_test  = df[df["split"] == "test"].copy()
     return df_train, df_val, df_test
-
 
 def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     y = df["target"].astype(float)
@@ -74,12 +56,8 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
         "day",
     ]
     X = df.drop(columns=[c for c in drop_cols if c in df.columns])
+    X = X.select_dtypes(include=["number", "bool"])
     return X, y
-
-
-# =========================
-# Plot predictions per product
-# =========================
 
 def plot_predictions_per_product(
     df_test: pd.DataFrame,
@@ -92,10 +70,6 @@ def plot_predictions_per_product(
     graph_type: str,
     max_plots: int | None = None,
 ) -> None:
-    """
-    Vẽ y_true vs y_pred theo ngày cho từng sản phẩm (node_id) trên test split.
-    Lưu 1 file .png / sản phẩm vào out_dir, prefix xgb_tabular_graphfeat_*.
-    """
     df_plot = df_test[["node_id", "date"]].copy()
     df_plot["y_true"] = np.asarray(y_test, dtype=float)
     df_plot["y_pred"] = np.asarray(y_test_pred, dtype=float)
@@ -125,11 +99,6 @@ def plot_predictions_per_product(
         plt.savefig(fname, dpi=150)
         plt.close()
 
-
-# =========================
-# Train 1 cấu hình (tabular + 1 graph_type)
-# =========================
-
 def train_xgb_tabular_graphfeat(
     horizon: int,
     temporal_type: str,
@@ -137,23 +106,19 @@ def train_xgb_tabular_graphfeat(
     graph_type: str,
     seed: int = 42,
 ) -> None:
-    """
-    graph_type: 'projected' | 'homo5' | 'hetero5'
-    """
     target_type = "raw"
     tag = (
         f"xgb_tabular_graphfeat_{graph_type}_h{horizon}_lag{lag_window}_"
         f"{temporal_type}_seed{seed}"
     )
 
-    set_global_seed(seed)  # <--- cố định RNG cho run này
+    set_global_seed(seed) 
 
     print(
         f"\n=== Training XGBoost TABULAR + {graph_type} graph features "
         f"(H{horizon}, lag={lag_window}, temporal_type={temporal_type}, "
         f"target_type={target_type}, seed={seed}) ==="
     )
-    # 1) Load tabular + graph features
     df_base = load_tabular_graphfeat(
         horizon=horizon,
         temporal_type=temporal_type,
@@ -166,11 +131,8 @@ def train_xgb_tabular_graphfeat(
         f"rows={len(df_base)}, unique(node,date)={df_base[['node_id','date']].drop_duplicates().shape[0]}"
     )
 
-    # 2) Split train/val/test
     df_train, df_val, df_test = split_train_val_test(df_base)
     print("Splits rows:", len(df_train), len(df_val), len(df_test))
-
-    # 3) Features & targets
     X_train, y_train_raw = prepare_features(df_train)
     X_val,   y_val_raw   = prepare_features(df_val)
     X_test,  y_test_raw  = prepare_features(df_test)
@@ -182,12 +144,11 @@ def train_xgb_tabular_graphfeat(
     print(
         f"\n[H{horizon}][lag{lag_window}][{graph_type}] Using {len(feature_names)} features:"
     )
-    print(feature_names[:50])  # in thử 50 feature đầu cho gọn
+    print(feature_names[:50]) 
     print(f"Train samples: {X_train.shape[0]}")
     print(f"Val   samples: {X_val.shape[0]}")
     print(f"Test  samples: {X_test.shape[0]}")
 
-    # 4) XGBoost model
     model = XGBRegressor(
         n_estimators=5000,
         max_depth=6,
@@ -215,7 +176,6 @@ def train_xgb_tabular_graphfeat(
     train_rmse_hist = evals_result["validation_0"]["rmse"]
     val_rmse_hist   = evals_result["validation_1"]["rmse"]
 
-    # 5) Learning curve
     plt.figure(figsize=(8, 5))
     plt.plot(train_rmse_hist, label="Train RMSE")
     plt.plot(val_rmse_hist, label="Val RMSE")
@@ -240,10 +200,8 @@ def train_xgb_tabular_graphfeat(
     plt.close()
     print(f"Saved learning curve to {out_curve}")
 
-    # 6) Metrics (raw scale, clip output >= 0)
-    # Train
     y_train_pred = model.predict(X_train)
-    y_train_pred = np.clip(y_train_pred, 0.0, None)  # không cho âm
+    y_train_pred = np.clip(y_train_pred, 0.0, None)  
     y_train_true = y_train_raw.values
 
     mae_train   = mean_absolute_error(y_train_true, y_train_pred)
@@ -251,7 +209,6 @@ def train_xgb_tabular_graphfeat(
     mape_train  = mape(y_train_true, y_train_pred)
     smape_train = smape(y_train_true, y_train_pred)
 
-    # Validation
     y_val_pred = model.predict(X_val)
     y_val_pred = np.clip(y_val_pred, 0.0, None)
     y_val_true = y_val_raw.values
@@ -261,7 +218,6 @@ def train_xgb_tabular_graphfeat(
     mape_val  = mape(y_val_true, y_val_pred)
     smape_val = smape(y_val_true, y_val_pred)
 
-    # Test
     y_test_pred = model.predict(X_test)
     y_test_pred = np.clip(y_test_pred, 0.0, None)
     y_test_true = y_test_raw.values
@@ -289,7 +245,6 @@ def train_xgb_tabular_graphfeat(
     print(f"  MAPE  : {mape_test:.4f}")
     print(f"  sMAPE : {smape_test:.4f}")
 
-    # 7) Lưu test predictions + plots
     base_pred_dir = PROC_DIR / "predictions" / "baseline_7"
     out_dir_csv = base_pred_dir / "csv" / f"{temporal_type}"
     plot_folder = f"{graph_type}_h{horizon}_lag{lag_window}"
@@ -352,17 +307,12 @@ def train_xgb_tabular_graphfeat(
         }
     )
 
-
-# =========================
-# Main: chạy hết 3 graph types × tất cả lag
-# =========================
-
 def main():
     global RUN_SUMMARY
     RUN_SUMMARY = []
 
     graph_types = ["projected", "homo5", "hetero5"]
-    seeds = [0, 1, 2]  # ví dụ 3 seed
+    seeds = [0, 1, 2] 
 
     for exp in DEFAULT_EXPERIMENTS:
         temporal_type = exp.temporal_type
@@ -429,5 +379,7 @@ def main():
         out_path.parent.mkdir(parents=True, exist_ok=True)
         df_sum.to_csv(out_path, index=False)
         print(f"\nSaved XGB + graph features summary (with seeds) to {out_path}")
+
+
 if __name__ == "__main__":
     main()

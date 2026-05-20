@@ -1,17 +1,20 @@
 import pickle
 from typing import Dict, Tuple, List
-
 import networkx as nx
 import numpy as np
 import pandas as pd
 import torch
-
+from typing import Dict, Tuple, Optional
+import numpy as np
+import pandas as pd
+import torch
+import joblib
 from config.config import (
     NODE_DIR,
     PROC_DIR,
     DEFAULT_EXPERIMENTS,
 )
-
+from data_preprocessing_baselines import load_node_metadata 
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 0)
 
@@ -46,34 +49,6 @@ EDGE_TYPE_PRODUCT_STORAGE = "product_storage"
 
 
 
-def load_node_metadata() -> pd.DataFrame:
-    node_index_path = NODE_DIR / "NodesIndex.csv"
-    node_group_path = NODE_DIR / "Node Types (Product Group and Subgroup).csv"
-    node_plant_storage_path = NODE_DIR / "Nodes Type (Plant & Storage).csv"
-
-    df_index = pd.read_csv(node_index_path)
-    df_index = df_index.rename(columns={"Node": "node_id", "NodeIndex": "node_index"})
-    df_index = df_index.drop_duplicates(keep="first")
-
-    df_group = pd.read_csv(node_group_path)
-    df_group = df_group.rename(
-        columns={"Node": "node_id", "Group": "group", "Sub-Group": "sub_group"}
-    )
-    df_group = df_group.drop_duplicates(keep="first")
-
-    df_plant = pd.read_csv(node_plant_storage_path)
-    df_plant = df_plant.rename(
-        columns={
-            "Node": "node_id",
-            "Plant": "plant",
-            "Storage Location": "storage_location",
-        }
-    )
-    df_plant = df_plant.drop_duplicates(keep="first")
-
-    df_meta = df_index.merge(df_group, on="node_id", how="left")
-    df_meta = df_meta.merge(df_plant, on="node_id", how="left")
-    return df_meta
 
 
 def sanity_check_alignment(df_meta: pd.DataFrame):
@@ -342,7 +317,6 @@ def build_projected_graph(df_meta: pd.DataFrame, by_col: str, out_name: str) -> 
             storage_location=row.get("storage_location"),
         )
 
-    # add projected edges
     df_valid = df_meta.dropna(subset=[by_col])
     for _, grp in df_valid.groupby(by_col):
         nodes = grp["node_id"].tolist()
@@ -354,11 +328,10 @@ def build_projected_graph(df_meta: pd.DataFrame, by_col: str, out_name: str) -> 
             for j in range(i + 1, n):
                 v = nodes[j]
                 if u == v:
-                    continue  # safety
+                    continue  
                 if not G.has_edge(u, v):
                     G.add_edge(u, v)
 
-    # remove any self-loops that might still exist (from old data / bugs)
     self_loops = list(nx.selfloop_edges(G))
     if self_loops:
         print(f"[Projected][{out_name}] Removing {len(self_loops)} self-loops")
@@ -369,7 +342,6 @@ def build_projected_graph(df_meta: pd.DataFrame, by_col: str, out_name: str) -> 
         f"|V|={G.number_of_nodes()}, |E|={G.number_of_edges()}"
     )
 
-    # save as before (gpickle + parquet)
     gpath = PROJ_DIR / f"{out_name}.gpickle"
     with open(gpath, "wb") as f:
         pickle.dump(G, f)
@@ -402,26 +374,13 @@ def build_all_projected_graphs(df_meta: pd.DataFrame):
     print(f"[Projected] Built all 4 projected product graphs in {PROJ_DIR}")
 
 
-def is_graph_side_ohe(col: str) -> bool:
-    col_lower = col.lower()
-    if col_lower.startswith("group_"):
-        return True
-    if col_lower.startswith("sub_group_"):
-        return True
-    if col_lower.startswith("plant_"):
-        return True
-    if col_lower.startswith("storage_") or col_lower.startswith("storage_location_"):
-        return True
-    return False
-
-
 def load_xgb_tabular_for_gnn(
     temporal_type: str,
     lag_window: int,
-    horizon: int ,
+    horizon: int,
 ) -> pd.DataFrame:
     path = XGB_BASE_DIR / f"xgboost_tabular_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
-    print(f"[GNN-DATA] Loading XGBoost tabular from {path}")
+    print(f"[GNN-DATA] Loading XGBoost tabular (multi-hot, no scale) from {path}")
     df = pd.read_parquet(path)
 
     required_cols = ["node_id", "node_index", "date", "day", "split", "target"]
@@ -439,10 +398,8 @@ def load_xgb_tabular_for_gnn(
     )
     return df
 
-
 def build_time_tensors_from_xgb_for_gnn(df: pd.DataFrame):
     df = df.copy()
-
     node_indices = np.sort(df["node_index"].dropna().unique())
     nodeindex2pos = {int(idx): i for i, idx in enumerate(node_indices)}
     N = len(node_indices)
@@ -452,16 +409,19 @@ def build_time_tensors_from_xgb_for_gnn(df: pd.DataFrame):
     T = len(days)
 
     drop_base = ["node_id", "node_index", "date", "day", "split", "target"]
+
     feature_cols = []
     for c in df.columns:
         if c in drop_base:
             continue
-        if is_graph_side_ohe(c):
+        if not np.issubdtype(df[c].dtype, np.number):
             continue
         feature_cols.append(c)
+
     Fdim = len(feature_cols)
 
     print(f"[GNN-DATA] #days={T}, #prod_nodes={N}, #features={Fdim}")
+    print(f"[GNN-DATA] feature_cols: {feature_cols}")
 
     X = np.zeros((T, N, Fdim), dtype=np.float32)
     Y = np.full((T, N), np.nan, dtype=np.float32)
@@ -498,17 +458,11 @@ def build_time_tensors_from_xgb_for_gnn(df: pd.DataFrame):
     }
     return pkg_common, nodeindex2pos
 
-
 def build_residual_time_tensors_for_gnn(
     df_xgb_tabular: pd.DataFrame,
     df_xgb_pred: pd.DataFrame,
-    is_log1p: bool = False,
+    use_log1p: bool = False,
 ):
-    """
-    Tạo tensor cho baseline 6 (residual GNN):
-    - X_residual: giống X_product nhưng append thêm 1 feature cuối là y_xgb
-    - R_residual: residual trên scale phù hợp (raw hoặc log1p).
-    """
     df = df_xgb_tabular.copy()
     df_pred = df_xgb_pred.copy()
 
@@ -517,7 +471,6 @@ def build_residual_time_tensors_for_gnn(
     df_pred["node_index"] = df_pred["node_index"].astype(int)
     df_pred["day"] = df_pred["day"].astype(int)
 
-    # join y_xgb vào tabular
     df = df.merge(
         df_pred[["node_id", "node_index", "date", "day", "y_xgb"]],
         on=["node_id", "node_index", "date", "day"],
@@ -525,7 +478,6 @@ def build_residual_time_tensors_for_gnn(
         validate="1:1",
     )
 
-    # index mapping giống build_time_tensors_from_xgb_for_gnn
     node_indices = np.sort(df["node_index"].dropna().unique())
     nodeindex2pos = {int(idx): i for i, idx in enumerate(node_indices)}
     N = len(node_indices)
@@ -539,38 +491,49 @@ def build_residual_time_tensors_for_gnn(
     for c in df.columns:
         if c in drop_base:
             continue
-        if is_graph_side_ohe(c):
+        if not np.issubdtype(df[c].dtype, np.number):
             continue
         feature_cols.append(c)
     feature_cols_res = feature_cols + ["y_xgb"]
     Fdim = len(feature_cols_res)
 
     print(f"[GNN-RESID] #days={T}, #prod_nodes={N}, #features={Fdim} (include y_xgb)")
+    print(f"[GNN-RESID] residual on RAW scale, use_log1p={use_log1p}")
 
     X = np.zeros((T, N, Fdim), dtype=np.float32)
     R = np.full((T, N), np.nan, dtype=np.float32)
 
-    df_sorted = df.sort_values(["day", "node_index"])
-    for _, row in df_sorted.iterrows():
+    y_true_raw = df["target"].values.astype(float)
+    y_xgb_raw = df["y_xgb"].values.astype(float)
+
+    df_sorted = df.sort_values(["day", "node_index"]).reset_index(drop=True)
+
+    y_xgb_raw_mat = np.full((T, N), np.nan, dtype=np.float32)
+
+    for idx, row in df_sorted.iterrows():
         t = day2idx[int(row["day"])]
         n = nodeindex2pos[int(row["node_index"])]
 
         x_feats = row[feature_cols].values.astype(np.float32)
-        y_xgb = float(row["y_xgb"])
-        y_true = float(row["target"])
+        y_xgb_raw_val = float(row["y_xgb"])
 
         X[t, n, :-1] = x_feats
-        X[t, n, -1] = y_xgb
+        X[t, n, -1] = y_xgb_raw_val  
 
-        if np.isnan(y_true) or np.isnan(y_xgb):
+        y_t = float(y_true_raw[idx])
+        y_hat = float(y_xgb_raw[idx])
+
+        if np.isnan(y_t) or np.isnan(y_hat):
             continue
 
-        if is_log1p:
-            z_true = np.log1p(max(y_true, 0.0))
-            z_xgb = np.log1p(max(y_xgb, 0.0))
-            R[t, n] = z_true - z_xgb
+        y_xgb_raw_mat[t, n] = y_hat
+
+        if use_log1p:
+            z_true = np.log1p(max(y_t, 0.0))
+            z_hat = np.log1p(max(y_hat, 0.0))
+            R[t, n] = z_true - z_hat
         else:
-            R[t, n] = y_true - y_xgb
+            R[t, n] = y_t - y_hat
 
     day_split = (
         df.groupby("day")["split"]
@@ -589,14 +552,16 @@ def build_residual_time_tensors_for_gnn(
     pkg_res = {
         "X_residual": torch.from_numpy(X),
         "R_residual": torch.from_numpy(R),
+        "y_xgb_raw": torch.from_numpy(y_xgb_raw_mat),
         "days": torch.tensor(days, dtype=torch.long),
         "split": day_split,
         "node_ids_product": node_ids_sorted,
         "node_index_product": torch.tensor(node_indices, dtype=torch.long),
         "feature_cols_residual": feature_cols_res,
+        "residual_on_original": True,
+        "use_log1p": use_log1p,
     }
     return pkg_res, nodeindex2pos
-
 
 def load_projected_edge_parquet(out_name: str) -> pd.DataFrame:
     return pd.read_parquet(PROJ_DIR / f"{out_name}_edges.parquet")
@@ -621,7 +586,6 @@ def build_projected_edge_indices(nodeindex2pos_prod: Dict[int, int], df_meta: pd
                 continue
             s_pos = nodeindex2pos_prod[idx_s]
             d_pos = nodeindex2pos_prod[idx_d]
-            # thêm cả hai chiều (s -> d) và (d -> s)
             src_pos.append(s_pos)
             dst_pos.append(d_pos)
             src_pos.append(d_pos)
@@ -670,7 +634,7 @@ def build_homo5type_from_parquet():
     num_nodes_dict = {}
     for nt, df_nt in type_groups.items():
         num_nodes_dict[nt] = len(df_nt)
-        for i, row in df_nt.iterrows():   # KHÔNG reset_index lại
+        for i, row in df_nt.iterrows():  
             nid = str(row["node_id"])
             nodeid2type[nid] = nt
             nodeid2local[nid] = int(i)
@@ -720,7 +684,6 @@ def build_homo5type_from_parquet():
     add_edge_type("product", "product_storage_edge", "storage_location", df_st)
 
     return edge_index_dict, num_nodes_dict, nodes_tbl
-
 
 def build_hetero5type_from_parquet():
     nodes_tbl = pd.read_parquet(HETERO_DIR / "nodes_heterogeneous_5type.parquet")
@@ -786,21 +749,11 @@ def build_hetero5type_from_parquet():
 
     return edge_index_dict, num_nodes_dict, nodes_tbl
 
-
 def make_homo5_flat_edge_index(
     edge_index_dict,
     num_nodes_dict: dict,
     node_type_order: list,
 ) -> torch.Tensor:
-    """
-    Chuyển edge_index_dict với index local từng node_type
-    thành edge_index_flat [2, E_total] trên không gian node global,
-    phù hợp với HomogeneousFiveTypeGINEncoder / Regressor.
-
-    edge_index_dict: {(src_type, rel, dst_type): tensor[2, E_rel]}
-    num_nodes_dict: {node_type: num_nodes}
-    node_type_order: [node_type_0, node_type_1, ...] (thứ tự concat)
-    """
     offsets = {}
     offset = 0
     for nt in node_type_order:
@@ -831,7 +784,6 @@ def make_homo5_flat_edge_index(
     edge_index_flat = torch.stack([src_cat, dst_cat], dim=0)
     return edge_index_flat
 
-
 def build_gnn_datasets_for_config(
     temporal_type: str,
     lag_window: int,
@@ -843,16 +795,12 @@ def build_gnn_datasets_for_config(
         f"from tabular: temporal_type={temporal_type}, "
         f"horizon={horizon}, lag_window={lag_window} ==="
     )
-
-    # 1) Load XGBoost tabular (no graph) cho horizon tương ứng
     df_xgb = load_xgb_tabular_for_gnn(
         temporal_type=temporal_type,
         lag_window=lag_window,
         horizon=horizon,
     )
     pkg_common, nodeindex2pos_prod = build_time_tensors_from_xgb_for_gnn(df_xgb)
-
-    # 2) Projected product graph (4 view)
     edge_index_proj = build_projected_edge_indices(nodeindex2pos_prod, df_meta)
     pkg_proj = {
         **pkg_common,
@@ -862,8 +810,6 @@ def build_gnn_datasets_for_config(
     out_proj = GNN_DIR / f"gnn_projected_h{horizon}_lag{lag_window}_{temporal_type}.pt"
     torch.save(pkg_proj, out_proj)
     print(f"[GNN-SAVE] projected dataset -> {out_proj}")
-
-    # 3) Homogeneous 5-type
     edge_index_homo5, num_nodes_homo5, nodes_homo_tbl = build_homo5type_from_parquet()
 
     node_type_order = sorted(nodes_homo_tbl["node_type"].unique().tolist())
@@ -885,7 +831,6 @@ def build_gnn_datasets_for_config(
     torch.save(pkg_homo5, out_homo5)
     print(f"[GNN-SAVE] homo5 dataset -> {out_homo5}")
 
-    # 4) Heterogeneous 5-type
     edge_index_het5, num_nodes_het5, nodes_het_tbl = build_hetero5type_from_parquet()
     pkg_het5 = {
         **pkg_common,
@@ -942,7 +887,6 @@ def compute_projected_graph_features(df_meta: pd.DataFrame) -> pd.DataFrame:
 
     df_out = df_meta_prod.merge(df_feat_all, on="node_id", how="left").fillna(0.0)
     return df_out
-
 
 def compute_homo_graph_features() -> pd.DataFrame:
     with open(HOMO_DIR / "homogeneous_5node_types.gpickle", "rb") as f:
@@ -1011,7 +955,6 @@ def compute_homo_graph_features() -> pd.DataFrame:
     df_feat = df_feat.merge(df_prod[["node_id", "node_index"]], on="node_id", how="inner")
     return df_feat
 
-
 def compute_hetero_graph_features() -> pd.DataFrame:
     with open(HETERO_DIR / "heterogeneous_5node_types.gpickle", "rb") as f:
         G_multi: nx.MultiDiGraph = pickle.load(f)
@@ -1069,8 +1012,12 @@ def compute_hetero_graph_features() -> pd.DataFrame:
     df_feat = df_feat.fillna(0.0)
     return df_feat
 
-
-def build_xgb_graph_baselines_for_config(temporal_type: str, horizon: int, lag_window: int, df_meta: pd.DataFrame):
+def build_xgb_graph_baselines_for_config(
+    temporal_type: str,
+    horizon: int,
+    lag_window: int,
+    df_meta: pd.DataFrame,
+):
     base_path = XGB_BASE_DIR / f"xgboost_tabular_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     if not base_path.exists():
         print(f"[XGB-GRAPH] Base XGBoost file not found: {base_path}, skip.")
@@ -1124,30 +1071,25 @@ def build_xgb_graph_baselines_for_config(temporal_type: str, horizon: int, lag_w
     out_het = XGB_GRAPH_DIR / f"xgboost_tabular_graph_hetero5_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
     df_het.to_parquet(out_het, index=False)
     print(f"[XGB-GRAPH] saved hetero5 graph baseline -> {out_het}")
-
-
+    
 def main():
     df_meta = load_node_metadata()
     sanity_check_alignment(df_meta)
 
-    # build graph structure (không phụ thuộc horizon)
     build_homogeneous_5type_graph(df_meta)
     build_heterogeneous_5type_graph(df_meta)
     build_all_projected_graphs(df_meta)
 
-    # cho mọi cấu hình trong DEFAULT_EXPERIMENTS
     for exp in DEFAULT_EXPERIMENTS:
         t_type = exp.temporal_type
         for H in exp.horizons:
             for L in exp.lag_windows:
-                # GNN datasets cho horizon H
                 build_gnn_datasets_for_config(
                     temporal_type=t_type,
                     lag_window=L,
                     horizon=H,
                     df_meta=df_meta,
                 )
-                # XGB + graph baselines cho horizon H
                 build_xgb_graph_baselines_for_config(
                     temporal_type=t_type,
                     horizon=H,

@@ -1,7 +1,6 @@
 import pandas as pd
 import torch
 from pathlib import Path
-
 from config.config import PROC_DIR, DEFAULT_EXPERIMENTS
 from models_gnn_encoder import (
     ProjectedGINEncoder,
@@ -14,17 +13,12 @@ pd.set_option("display.width", 0)
 
 GNN_DIR = PROC_DIR / "gnn"
 GNN_DIR.mkdir(parents=True, exist_ok=True)
-
-# Chứa encoder checkpoints đã train, bạn đã save ở đây khi train GNN
 GNN_TRAINED_DIR = GNN_DIR / "trained"
 GNN_TRAINED_DIR.mkdir(parents=True, exist_ok=True)
-
 EMB_DIR = PROC_DIR / "gnn_embeddings"
 EMB_DIR.mkdir(parents=True, exist_ok=True)
-
 XGB_GNN_EMBED_DIR = PROC_DIR / "baseline" / "xgb_gnn_embed"
 XGB_GNN_EMBED_DIR.mkdir(parents=True, exist_ok=True)
-
 
 def get_experiment_params():
     temporal_types = sorted({exp.temporal_type for exp in DEFAULT_EXPERIMENTS})
@@ -32,21 +26,16 @@ def get_experiment_params():
     lag_windows = sorted({L for exp in DEFAULT_EXPERIMENTS for L in exp.lag_windows})
     return temporal_types, horizons, lag_windows
 
-
 TEMPORAL_TYPES, HORIZONS, LAG_WINDOWS = get_experiment_params()
 from pathlib import Path
 import pandas as pd
 import numpy as np
-
 from config.config import PROC_DIR
-
 EMB_DIR = PROC_DIR / "gnn_embeddings"
 XGB_BASE_DIR = PROC_DIR / "baseline" / "xgboost"
 XGB_GNN_EMBED_DIR = PROC_DIR / "baseline" / "xgb_gnn_embed"
 XGB_GNN_EMBED_DIR.mkdir(parents=True, exist_ok=True)
-
 PROJECTED_VIEWS = ["same_group", "same_subgroup", "same_plant", "same_storage"]
-
 
 def build_xgb_tabular_gnnembed_projected4view(
     horizon: int,
@@ -55,7 +44,6 @@ def build_xgb_tabular_gnnembed_projected4view(
     seed: int,
     mode_name: str = "raw",
 ) -> None:
-    # 1) Load tabular base
     base_path = (
         XGB_BASE_DIR
         / f"xgboost_tabular_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
@@ -69,7 +57,6 @@ def build_xgb_tabular_gnnembed_projected4view(
     df_base["day"] = df_base["day"].astype(int)
     df_base["node_index"] = df_base["node_index"].astype(int)
 
-    # Đảm bảo unique trên (day, node_index)
     df_base = (
         df_base.sort_values(["day", "node_index", "date"])
         .drop_duplicates(subset=["day", "node_index"], keep="last")
@@ -79,7 +66,6 @@ def build_xgb_tabular_gnnembed_projected4view(
         f"unique(day,node_index)={df_base[['day','node_index']].drop_duplicates().shape[0]}"
     )
 
-    # 2) Load projected 4-view embeddings (long)
     emb_path = (
         EMB_DIR
         / f"gnn_projected_emb_4views_h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}_{mode_name}.parquet"
@@ -92,14 +78,11 @@ def build_xgb_tabular_gnnembed_projected4view(
     df_emb["day"] = df_emb["day"].astype(int)
     df_emb["node_index_pos"] = df_emb["node_index_pos"].astype(int)
 
-    # Map node_index_pos -> node_index (giống build_time_tensors_from_xgb_for_gnn)
-    # node_index_product trong pkg_common đã sort; ở đây ta tái lập mapping từ base
     node_indices = np.sort(df_base["node_index"].unique())
     pos2nodeindex = {pos: int(idx) for pos, idx in enumerate(node_indices)}
 
     df_emb["node_index"] = df_emb["node_index_pos"].map(pos2nodeindex)
 
-    # 3) Pivot 4 view thành 1 hàng (day, node_index)
     dfs = []
     for view in PROJECTED_VIEWS:
         d_v = df_emb[df_emb["view"] == view].copy()
@@ -109,8 +92,6 @@ def build_xgb_tabular_gnnembed_projected4view(
 
         emb_cols = [c for c in d_v.columns if c.startswith("emb_")]
         d_v = d_v[["day", "node_index"] + emb_cols]
-
-        # rename emb_0 -> emb_0_same_group, ...
         d_v = d_v.rename(columns={c: f"{c}_{view}" for c in emb_cols})
 
         dfs.append(d_v)
@@ -132,11 +113,10 @@ def build_xgb_tabular_gnnembed_projected4view(
         f"unique(day,node_index)={df_emb_wide[['day','node_index']].drop_duplicates().shape[0]}"
     )
 
-    # 4) Join base + embeddings theo (day, node_index)
     df_merged = df_base.merge(
         df_emb_wide,
         on=["day", "node_index"],
-        how="inner",        # chỉ giữ sample có đủ embedding
+        how="inner",        
         validate="1:1",
     )
     print(
@@ -214,10 +194,6 @@ def build_xgb_tabular_gnnembed_homo_or_hetero(
     df_merged.to_parquet(out_path, index=False)
     print(f"[XGB-GNNEMB-{graph_type}] Saved tabular+{graph_type} to {out_path}")
 
-# ============================================================
-# 1. EXPORT EMBEDDINGS
-# ============================================================
-
 PROJECTED_VIEWS = ["same_group", "same_subgroup", "same_plant", "same_storage"]
 
 
@@ -227,7 +203,7 @@ def export_projected_embeddings_for_config(
     horizon: int,
     device: str = "cuda",
     seed: int = 0,
-    mode_name: str = "raw",  # "raw" / "softplus" / "log1p"
+    mode_name: str = "raw", 
 ) -> None:
     pkg_path = GNN_DIR / f"gnn_projected_h{horizon}_lag{lag_window}_{temporal_type}.pt"
     if not pkg_path.exists():
@@ -236,9 +212,9 @@ def export_projected_embeddings_for_config(
 
     print(f"[EXPORT-PROJ] Loading graph package from {pkg_path}")
     pkg = torch.load(pkg_path, map_location=device, weights_only=False)
-    X_product = pkg["X_product"]          # [T, N_prod, F_in]
-    days = pkg["days"]                    # tensor [T]
-    split = pkg["split"]                  # list[str]
+    X_product = pkg["X_product"]        
+    days = pkg["days"]                    
+    split = pkg["split"]                 
     edge_index_dict = pkg["edge_index_dict"]
 
     T, N_prod, F_in = X_product.shape
@@ -246,7 +222,7 @@ def export_projected_embeddings_for_config(
     rows = []
     with torch.no_grad():
         for view_name in PROJECTED_VIEWS:
-            # 1) load encoder theo view
+
             enc_path = (
                 GNN_TRAINED_DIR
                 / f"projected_encoder_{view_name}_h{horizon}_lag{lag_window}_"
@@ -278,7 +254,7 @@ def export_projected_embeddings_for_config(
 
             for t in range(T):
                 x_t = X_product[t].to(device)
-                h_t = encoder(x_t, edge_index)   # [N_prod, d]
+                h_t = encoder(x_t, edge_index)   
                 h_np = h_t.cpu().numpy()
                 day_t = int(days[t])
                 split_t = split[t]
@@ -320,10 +296,6 @@ def export_homo5_embeddings_for_config(
     seed: int = 0,
     mode_name: str = "raw",
 ) -> None:
-    """
-    Đọc gnn_homo5_h{horizon}_lag{L}_{temporal_type}.pt (graph data)
-    + encoder đã train → chạy HomogeneousFiveTypeGINEncoder → embedding cho product.
-    """
     pkg_path = GNN_DIR / f"gnn_homo5_h{horizon}_lag{lag_window}_{temporal_type}.pt"
     if not pkg_path.exists():
         print(f"[EXPORT-HOMO5] {pkg_path} not found, skip.")
@@ -339,17 +311,16 @@ def export_homo5_embeddings_for_config(
         )
         return
 
-    X_product = pkg["X_product"]          # [T, N_prod, F_in_prod]
-    days = pkg["days"]                    # tensor [T]
-    split = pkg["split"]                  # list[str]
-    edge_index = pkg["edge_index"]        # [2, E_total]
+    X_product = pkg["X_product"]        
+    days = pkg["days"]                    
+    split = pkg["split"]                  
+    edge_index = pkg["edge_index"]        
     num_nodes_dict = pkg["num_nodes_dict"]
-    nodes_tbl = pkg["nodes_homo_table"]   # DataFrame nodes_homogeneous_5type
+    nodes_tbl = pkg["nodes_homo_table"]  
 
     node_type_order = nodes_tbl["node_type"].unique().tolist()
     T, N_prod, F_in = X_product.shape
 
-    # encoder checkpoint
     enc_path = (
         GNN_TRAINED_DIR
         / f"homo5_encoder_h{horizon}_lag{lag_window}_{temporal_type}_{mode_name}_seed{seed}.pt"
@@ -376,7 +347,6 @@ def export_homo5_embeddings_for_config(
     edge_index = edge_index.to(device)
     with torch.no_grad():
         for t in range(T):
-            # build x_dict: product có feature, node type khác = 0
             x_dict = {}
             for nt in node_type_order:
                 n_type = num_nodes_dict[nt]
@@ -390,7 +360,7 @@ def export_homo5_embeddings_for_config(
             for nt in x_dict:
                 x_dict[nt] = x_dict[nt].to(device)
 
-            h_prod = encoder(x_dict, edge_index)  # [N_prod, hidden]
+            h_prod = encoder(x_dict, edge_index)  
             h_np = h_prod.cpu().numpy()
             day_t = int(days[t])
             split_t = split[t]
@@ -432,10 +402,6 @@ def export_hetero5_embeddings_for_config(
     seed: int = 0,
     mode_name: str = "raw",
 ) -> None:
-    """
-    Đọc gnn_hetero5_h{horizon}_lag{lag_window}_{temporal_type}.pt (graph data)
-    + encoder đã train → HeterogeneousGINEncoder → embedding cho product nodes.
-    """
     pkg_path = GNN_DIR / f"gnn_hetero5_h{horizon}_lag{lag_window}_{temporal_type}.pt"
     if not pkg_path.exists():
         print(f"[EXPORT-HET5] {pkg_path} not found, skip.")
@@ -444,9 +410,9 @@ def export_hetero5_embeddings_for_config(
     print(f"[EXPORT-HET5] Loading graph package from {pkg_path}")
     pkg = torch.load(pkg_path, map_location=device, weights_only=False)
 
-    X_product = pkg["X_product"]          # [T, N_prod, F_in_prod]
-    days = pkg["days"]                    # tensor [T]
-    split = pkg["split"]                  # list[str]
+    X_product = pkg["X_product"]         
+    days = pkg["days"]                    
+    split = pkg["split"]                  
     edge_index_dict = pkg["edge_index_dict"]
     num_nodes_dict = pkg["num_nodes_dict"]
     nodes_tbl = pkg["nodes_hetero_table"]
@@ -459,7 +425,6 @@ def export_hetero5_embeddings_for_config(
     for nt in node_types:
         in_channels_dict[nt] = F_in
 
-    # encoder checkpoint
     enc_path = (
         GNN_TRAINED_DIR
         / f"hetero5_encoder_h{horizon}_lag{lag_window}_{temporal_type}_{mode_name}_seed{seed}.pt"
@@ -497,12 +462,11 @@ def export_hetero5_embeddings_for_config(
             for nt in x_dict:
                 x_dict[nt] = x_dict[nt].to(device)
 
-            # edge_index_dict đã ở đúng device? nếu chưa:
             edge_index_dict_device = {
                 k: v.to(device) for k, v in edge_index_dict.items()
             }
 
-            h_prod = encoder(x_dict, edge_index_dict_device)   # [N_prod, hidden]
+            h_prod = encoder(x_dict, edge_index_dict_device)   
             h_np = h_prod.cpu().numpy()
             day_t = int(days[t])
             split_t = split[t]
@@ -544,7 +508,6 @@ def main():
                         f"H{H}, lag={L}, temporal={t_type}, seed={seed} ==="
                     )
 
-                    # 1) Export embeddings
                     export_projected_embeddings_for_config(
                         temporal_type=t_type,
                         lag_window=L,
@@ -570,7 +533,6 @@ def main():
                         mode_name=mode_name,
                     )
 
-                    # 2) Build tabular+embedding
                     build_xgb_tabular_gnnembed_projected4view(
                         horizon=H,
                         lag_window=L,

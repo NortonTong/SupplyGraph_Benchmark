@@ -13,9 +13,6 @@ pd.set_option("display.width", 0)
 
 RUN_SUMMARY: list[dict] = []
 
-# =========================
-# Experiment params (multi-horizon)
-# =========================
 
 def get_experiment_params():
     temporal_types = sorted({exp.temporal_type for exp in DEFAULT_EXPERIMENTS})
@@ -25,10 +22,6 @@ def get_experiment_params():
 
 TEMPORAL_TYPES, HORIZONS, LAG_WINDOWS = get_experiment_params()
 GRAPH_MODES: list[Literal["proj", "homo", "hetero"]] = ["proj", "homo", "hetero"]
-
-# =========================
-# Metrics
-# =========================
 
 def mape(y_true, y_pred, eps=1e-8):
     y_true = np.asarray(y_true, dtype=float)
@@ -44,10 +37,6 @@ def smape(y_true, y_pred, eps=1e-8):
     denom = (np.abs(y_true) + np.abs(y_pred)) + eps
     return float(np.mean(2.0 * np.abs(y_pred - y_true) / denom) * 100.0)
 
-# =========================
-# Load tabular + GNN embedding baseline
-# =========================
-
 def load_tabular_gnn_embed_baseline(
     horizon: int,
     temporal_type: str = "unit",
@@ -55,12 +44,6 @@ def load_tabular_gnn_embed_baseline(
     graph_mode: Literal["proj", "homo", "hetero"] = "proj",
     seed: int = 0,
 ) -> pd.DataFrame:
-    """
-    Đọc file parquet đã merge base_full_unit + GNN embeddings.
-    Ví dụ:
-      data/processed/baseline/xgb_gnn_embed/
-        xgboost_tabular_gnnembed_{graph_mode}_h{H}_lag{L}_{temporal_type}_seed{seed}.parquet
-    """
     base_dir = PROC_DIR / "baseline" / "xgb_gnn_embed"
 
     if graph_mode == "proj":
@@ -85,10 +68,6 @@ def load_tabular_gnn_embed_baseline(
     print(f"[Baseline5] Loading XGB + GNN embedding tabular from {path}")
     return pd.read_parquet(path)
 
-# =========================
-# Features
-# =========================
-
 def split_train_val_test(df: pd.DataFrame):
     df_train = df[df["split"] == "train"].copy()
     df_val = df[df["split"] == "val"].copy()
@@ -105,13 +84,10 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
         "date",
         "day",
     ]
-    feature_cols = [c for c in df.columns if c not in drop_cols]
-    X = df[feature_cols].copy()
+    X = df.drop(columns=[c for c in drop_cols if c in df.columns])
+    X = X.select_dtypes(include=["number", "bool"])
+    
     return X, target
-
-# =========================
-# Plot predictions (per product)
-# =========================
 
 def plot_predictions_per_product(
     df_test: pd.DataFrame,
@@ -124,10 +100,6 @@ def plot_predictions_per_product(
     temporal_type: str,
     max_plots: int | None = None,
 ) -> None:
-    """
-    Vẽ y_true vs y_pred theo ngày cho từng sản phẩm (node_id) trên test split.
-    Lưu 1 file .png / sản phẩm vào out_dir, prefix xgb_gnn_embed_*.
-    """
     df_plot = df_test[["node_id", "date"]].copy()
     df_plot["y_true"] = np.asarray(y_test, dtype=float)
     df_plot["y_pred"] = np.asarray(y_test_pred, dtype=float)
@@ -162,10 +134,6 @@ def plot_predictions_per_product(
         plt.savefig(fname, dpi=150)
         plt.close()
 
-# =========================
-# Train 1 cấu hình
-# =========================
-
 def train_xgb_gnn_embed_baseline(
     horizon: int,
     temporal_type: str = "unit",
@@ -174,7 +142,7 @@ def train_xgb_gnn_embed_baseline(
     tag: str | None = None,
     seed: int = 0,
 ) -> None:
-    target_type = "raw"  # dùng target raw, align với baseline 1,3 & GRU
+    target_type = "raw" 
 
     if tag is None:
         tag = (
@@ -188,7 +156,6 @@ def train_xgb_gnn_embed_baseline(
         f"graph_mode={graph_mode}, target_type={target_type}, tag={tag} ==="
     )
 
-    # 1) Load tabular + GNN embedding baseline (precomputed)
     df_base = load_tabular_gnn_embed_baseline(
         horizon=horizon,
         temporal_type=temporal_type,
@@ -204,11 +171,9 @@ def train_xgb_gnn_embed_baseline(
         f"unique(node,date)={df_base[['node_id','date']].drop_duplicates().shape[0]}"
     )
 
-    # 2) Split train/val/test
     df_train, df_val, df_test = split_train_val_test(df_base)
     print("Splits rows:", len(df_train), len(df_val), len(df_test))
 
-    # 3) Features & targets (raw y)
     X_train, y_train = prepare_features(df_train)
     X_val, y_val = prepare_features(df_val)
     X_test, y_test = prepare_features(df_test)
@@ -223,7 +188,6 @@ def train_xgb_gnn_embed_baseline(
     print(f"Val   samples: {X_val.shape[0]}")
     print(f"Test  samples: {X_test.shape[0]}")
 
-    # 4) XGBoost model
     model = XGBRegressor(
         n_estimators=5000,
         max_depth=6,
@@ -232,7 +196,7 @@ def train_xgb_gnn_embed_baseline(
         colsample_bytree=0.8,
         objective="reg:squarederror",
         tree_method="hist",
-        random_state=seed,   # seed ảnh hưởng XGB; embedding đã encode theo seed này
+        random_state=seed,
         n_jobs=-1,
         eval_metric="rmse",
         early_stopping_rounds=100,
@@ -250,7 +214,6 @@ def train_xgb_gnn_embed_baseline(
     train_rmse_hist = evals_result["validation_0"]["rmse"]
     val_rmse_hist = evals_result["validation_1"]["rmse"]
 
-    # 5) Learning curve
     plt.figure(figsize=(8, 5))
     plt.plot(train_rmse_hist, label="Train RMSE (target scale)")
     plt.plot(val_rmse_hist, label="Val RMSE (target scale)")
@@ -279,22 +242,18 @@ def train_xgb_gnn_embed_baseline(
 
     print(f"Saved learning curve to {out_curve}")
 
-    # 6) Metrics trên scale gốc (raw)
-    # Train
     y_train_pred = model.predict(X_train)
     mae_train = mean_absolute_error(y_train, y_train_pred)
     rmse_train = root_mean_squared_error(y_train, y_train_pred)
     mape_train = mape(y_train, y_train_pred)
     smape_train = smape(y_train, y_train_pred)
 
-    # Validation
     y_val_pred = model.predict(X_val)
     mae_val = mean_absolute_error(y_val, y_val_pred)
     rmse_val = root_mean_squared_error(y_val, y_val_pred)
     mape_val = mape(y_val, y_val_pred)
     smape_val = smape(y_val, y_val_pred)
 
-    # Test
     y_test_pred = model.predict(X_test)
     mae_test = mean_absolute_error(y_test, y_test_pred)
     rmse_test = root_mean_squared_error(y_test, y_test_pred)
@@ -347,7 +306,6 @@ def train_xgb_gnn_embed_baseline(
         }
     )
 
-    # 7) Save test predictions & plots per product
     base_pred_dir = PROC_DIR / "predictions" / "baseline_5"
     out_dir_csv = base_pred_dir / "csv" / temporal_type / graph_mode
     plot_folder = f"{target_type}_h{horizon}_lag{lag_window}"
@@ -386,15 +344,11 @@ def train_xgb_gnn_embed_baseline(
     )
     print(f"Saved per-product prediction plots to {out_dir_plot}")
 
-# =========================
-# Main: run all configs
-# =========================
-
 def main():
     global RUN_SUMMARY
     RUN_SUMMARY = []
 
-    seeds = [0, 1, 2]  # chạy nhiều seed để aggregate mean/std sau
+    seeds = [0, 1, 2] 
 
     for temporal_type in TEMPORAL_TYPES:
         for horizon in HORIZONS:

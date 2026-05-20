@@ -1,5 +1,3 @@
-# build_advanced_graph_features.py
-
 import numpy as np
 import pandas as pd
 
@@ -12,14 +10,7 @@ from build_graphs import (
     build_hetero5type_from_parquet,
 )
 
-# =========================
-# Helper: mapping & Y[t,i]
-# =========================
-
 def build_product_index_mapping(df_base: pd.DataFrame):
-    """
-    Dùng node_index (int) để mapping product -> vị trí trong ma trận Y.
-    """
     df_nodes = (
         df_base[["node_index"]]
         .drop_duplicates()
@@ -34,14 +25,6 @@ def build_Ys_from_base(
     node_indices,
     value_cols: list[str],
 ) -> tuple[dict[str, np.ndarray], np.ndarray]:
-    """
-    Trả về:
-      - Ys: dict[value_name] -> Y_value (T x N)
-      - days: vector ngày (T,)
-
-    Với mỗi value_name trong value_cols (vd 'sales', 'production', ...),
-    Y_value[t, i] = giá trị tại day t, product i (theo node_index).
-    """
     df = df_base.sort_values(["day", "node_index"]).copy()
     days = np.sort(df["day"].unique())
     T = len(days)
@@ -49,14 +32,10 @@ def build_Ys_from_base(
 
     day2idx = {int(d): k for k, d in enumerate(days)}
     idx2pos = {int(n): i for i, n in enumerate(node_indices)}
-
-    # chuẩn bị ma trận
     Ys: dict[str, np.ndarray] = {}
     for v in value_cols:
         Ys[v] = np.full((T, N), np.nan, dtype=float)
 
-    # xác định cột thật trong df
-    # sales_order / target
     if "sales_order" in df.columns:
         col_sales = "sales_order"
     elif "target" in df.columns:
@@ -68,40 +47,29 @@ def build_Ys_from_base(
         t = day2idx[int(r["day"])]
         pos = idx2pos[int(r["node_index"])]
 
-        # sales (sales_order / target)
         if "sales" in value_cols and col_sales is not None:
             val = r[col_sales]
             if not pd.isna(val):
                 Ys["sales"][t, pos] = float(val)
 
-        # production
         if "production" in value_cols and "production" in df.columns:
             val = r["production"]
             if not pd.isna(val):
                 Ys["production"][t, pos] = float(val)
 
-        # delivery
         if "delivery" in value_cols and "delivery" in df.columns:
             val = r["delivery"]
             if not pd.isna(val):
                 Ys["delivery"][t, pos] = float(val)
 
-        # factory_issue
         if "factory_issue" in value_cols and "factory_issue" in df.columns:
             val = r["factory_issue"]
             if not pd.isna(val):
                 Ys["factory_issue"][t, pos] = float(val)
 
     return Ys, days
-# =========================
-# Neighbor indices: projected
-# =========================
 
 def build_neighbor_indices_projected(df_meta: pd.DataFrame, idx2pos: dict):
-    """
-    Dùng metadata để tạo neighbor list cho 4 projected views
-    trên trục node_index (int).
-    """
     neighbors = {
         k: [[] for _ in range(len(idx2pos))]
         for k in ["same_group", "same_subgroup", "same_plant", "same_storage"]
@@ -126,15 +94,7 @@ def build_neighbor_indices_projected(df_meta: pd.DataFrame, idx2pos: dict):
         neighbors[key] = [sorted(set(lst)) for lst in neighbors[key]]
     return neighbors
 
-
-# =========================
-# Neighbor indices: homo5
-# =========================
-
 def build_neighbor_indices_homo5(edge_index_homo5, nodes_homo_tbl: pd.DataFrame, idx2pos: dict):
-    """
-    Dùng graph homo5 để xác định neighbors theo group/sub_group/plant/storage.
-    """
     nodes = nodes_homo_tbl.copy()
     nodes["node_id"] = nodes["node_id"].astype(str)
 
@@ -192,15 +152,7 @@ def build_neighbor_indices_homo5(edge_index_homo5, nodes_homo_tbl: pd.DataFrame,
     neighbors_homo["homo_storage"] = _neighbors_via_edge_key("product_storage_edge", "storage_location")
     return neighbors_homo
 
-
-# =========================
-# Neighbor indices: hetero5
-# =========================
-
 def build_neighbor_indices_hetero5(edge_index_het5, nodes_het_tbl: pd.DataFrame, idx2pos: dict):
-    """
-    Dùng graph hetero5 để xác định neighbors theo group/sub_group/plant/storage.
-    """
     nodes = nodes_het_tbl.copy()
     nodes["node_id"] = nodes["node_id"].astype(str)
 
@@ -257,11 +209,6 @@ def build_neighbor_indices_hetero5(edge_index_het5, nodes_het_tbl: pd.DataFrame,
     neighbors_het["het_plant"] = _neighbors_via_edge_type("product_plant", "plant")
     neighbors_het["het_storage"] = _neighbors_via_edge_type("product_storage", "storage_location")
     return neighbors_het
-
-
-# =========================
-# Neighbor-based features
-# =========================
 
 def neighbor_mean_lag(Y, neighbor_idx, lag: int):
     T, N = Y.shape
@@ -335,18 +282,12 @@ def neighbor_zero_ratio_window(Y, neighbor_idx, window: int):
             feat[t, i] = float(np.mean(vals == 0))
     return feat
 
-
-# =========================
-# 3 builders: thêm advanced feature vào df_base đã OHE
-# =========================
-
 def build_xgb_with_proj_features(df_base: pd.DataFrame,
                                  temporal_type: str,
                                  horizon: int,
                                  lag_window: int) -> pd.DataFrame:
     node_indices, idx2pos = build_product_index_mapping(df_base)
 
-    # build Ys cho 4 biến
     value_cols = ["sales", "production", "delivery", "factory_issue"]
     Ys, days = build_Ys_from_base(df_base, node_indices, value_cols)
 
@@ -360,7 +301,6 @@ def build_xgb_with_proj_features(df_base: pd.DataFrame,
     for view in ["same_group", "same_subgroup", "same_plant", "same_storage"]:
         neigh = neighbors_proj[view]
         for vname, Yv in Ys.items():
-            # sales / production / delivery / factory_issue
             for L in lags:
                 feats[f"adv_{vname}_proj_{view}_mean_lag{L}"] = neighbor_mean_lag(Yv, neigh, L)
                 feats[f"adv_{vname}_proj_{view}_sum_lag{L}"]  = neighbor_sum_lag(Yv, neigh, L)
@@ -370,7 +310,6 @@ def build_xgb_with_proj_features(df_base: pd.DataFrame,
                 Yv, neigh, win_zero
             )
 
-    # flatten & merge
     records = []
     T = len(days)
     N = len(node_indices)
@@ -465,10 +404,6 @@ def build_xgb_with_hetero_features(df_base: pd.DataFrame,
     df_merged = df_base.merge(df_feat, on=["day", "node_index"], how="left")
     return df_merged
 
-# =========================
-# main: dùng DEFAULT_EXPERIMENTS + baseline graph
-# =========================
-
 def main():
     base_graph_dir = PROC_DIR / "baseline" / "xgb_graph"
     out_dir = PROC_DIR / "baseline" / "xgboost"
@@ -479,8 +414,6 @@ def main():
         for H in exp.horizons:
             for L in exp.lag_windows:
                 print(f"\n=== Advanced graph features: temporal_type={t_type}, H={H}, L={L} ===")
-
-                # 1) projected
                 path_proj = base_graph_dir / f"xgboost_tabular_graph_projected_h{H}_lag{L}_{t_type}.parquet"
                 if path_proj.exists():
                     df_proj = pd.read_parquet(path_proj)
@@ -497,7 +430,6 @@ def main():
                 else:
                     print(f"[ADV-GRAPH] projected baseline not found: {path_proj}")
 
-                # 2) homo5
                 path_homo = base_graph_dir / f"xgboost_tabular_graph_homo5_h{H}_lag{L}_{t_type}.parquet"
                 if path_homo.exists():
                     df_homo = pd.read_parquet(path_homo)
@@ -514,7 +446,6 @@ def main():
                 else:
                     print(f"[ADV-GRAPH] homo5 baseline not found: {path_homo}")
 
-                # 3) hetero5
                 path_het = base_graph_dir / f"xgboost_tabular_graph_hetero5_h{H}_lag{L}_{t_type}.parquet"
                 if path_het.exists():
                     df_het = pd.read_parquet(path_het)

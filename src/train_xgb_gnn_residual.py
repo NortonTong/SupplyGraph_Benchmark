@@ -27,8 +27,6 @@ from models_gnn import (
     HeterogeneousGINRegressor,
 )
 
-# ========= Seeding =========
-
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -36,11 +34,8 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-# ========= GLOBAL RUN SUMMARY =========
-
 RUN_SUMMARY: list[dict] = []
 
-# ========= Metrics & EarlyStopping =========
 
 def mae(y_true, y_pred):
     y_true = np.asarray(y_true, dtype=float)
@@ -113,8 +108,6 @@ def get_time_splits(days: np.ndarray, split) -> Tuple[List[int], List[int], List
     print(f"[SPLIT] train={len(idx_train)}, val={len(idx_val)}, test={len(idx_test)}")
     return idx_train, idx_val, idx_test
 
-# ========= Plot per-product =========
-
 def plot_baseline6_predictions_per_product(
     days_test: np.ndarray,
     node_ids: np.ndarray,
@@ -178,8 +171,6 @@ def plot_baseline6_predictions_per_product(
 
     print(f"[PLOT-BL6] Saved per-product prediction plots to {out_dir}")
 
-# ========= Shared residual training core =========
-
 def train_residual_projected(
     temporal_type: str,
     lag_window: int,
@@ -214,14 +205,16 @@ def train_residual_projected(
     print(f"[RESID-PROJ] Loading XGBoost predictions from {pred_path}")
     df_pred = pd.read_parquet(pred_path)
 
+
     pkg_res, nodeindex2pos_prod = build_residual_time_tensors_for_gnn(
         df_xgb_tabular=df_xgb,
         df_xgb_pred=df_pred,
-        is_log1p=is_log1p,
+        use_log1p=is_log1p,
     )
 
-    X_res = pkg_res["X_residual"].float()  # [T, N, F_res]
-    R_res = pkg_res["R_residual"].float()  # [T, N]
+    X_res = pkg_res["X_residual"].float()
+    R_res = pkg_res["R_residual"].float()  
+    Y_XGB_ORIG = pkg_res["y_xgb_raw"].float()  
     days = np.array(pkg_res["days"])
     split = pkg_res["split"]
     node_ids = pkg_res["node_ids_product"]
@@ -266,8 +259,8 @@ def train_residual_projected(
 
             loss_block = 0.0
             for b in range(X_block.size(0)):
-                x_b = X_block[b]        # [N, F_res]
-                r_true_b = R_block[b]   # [N]
+                x_b = X_block[b]      
+                r_true_b = R_block[b]  
 
                 r_pred_b = model(x_b, edge_index)
 
@@ -310,18 +303,19 @@ def train_residual_projected(
             for t in idxs:
                 x_t = X_res[t].to(device)
                 r_true_t = R_res[t].to(device)
-                y_xgb_t = X_res[t, :, -1].to(device)
-
                 r_pred_t = model(x_t, edge_index)
+                y_xgb_orig_t = Y_XGB_ORIG[t].to(device)
 
                 if is_log1p:
-                    z_xgb_t = torch.log1p(y_xgb_t.clamp_min(0.0))
+                    z_xgb_t = torch.log1p(y_xgb_orig_t.clamp_min(0.0))
                     z_hat_t = z_xgb_t + r_pred_t
                     y_hat_t = torch.expm1(z_hat_t).clamp_min(0.0)
-                    y_true_t = torch.expm1(z_xgb_t + r_true_t).clamp_min(0.0)
+
+                    z_true_t = z_xgb_t + r_true_t
+                    y_true_t = torch.expm1(z_true_t).clamp_min(0.0)
                 else:
-                    y_hat_t = (y_xgb_t + r_pred_t).clamp_min(0.0)
-                    y_true_t = (y_xgb_t + r_true_t).clamp_min(0.0)
+                    y_hat_t = (y_xgb_orig_t + r_pred_t).clamp_min(0.0)
+                    y_true_t = (y_xgb_orig_t + r_true_t).clamp_min(0.0)
 
                 y_true_list.append(y_true_t.cpu().numpy())
                 y_pred_list.append(y_hat_t.cpu().numpy())
@@ -472,11 +466,11 @@ def train_residual_homo5(
     pkg_res, nodeindex2pos_prod = build_residual_time_tensors_for_gnn(
         df_xgb_tabular=df_xgb,
         df_xgb_pred=df_pred,
-        is_log1p=is_log1p,
+        use_log1p=is_log1p,
     )
 
-    X_res = pkg_res["X_residual"].float()  # [T, N_prod, F_res]
-    R_res = pkg_res["R_residual"].float()  # [T, N_prod]
+    X_res = pkg_res["X_residual"].float()  
+    R_res = pkg_res["R_residual"].float()  
     days = np.array(pkg_res["days"])
     split = pkg_res["split"]
     node_ids = pkg_res["node_ids_product"]
@@ -546,8 +540,8 @@ def train_residual_homo5(
 
             loss_block = 0.0
             for b in range(X_block.size(0)):
-                x_prod_b = X_block[b]   # [N_prod, F_res]
-                r_true_b = R_block[b]   # [N_prod]
+                x_prod_b = X_block[b]  
+                r_true_b = R_block[b]
 
                 x_all = torch.zeros(offset, F_res, device=device)
                 x_all[torch.from_numpy(prod_global_idx).to(device)] = x_prod_b
@@ -559,7 +553,7 @@ def train_residual_homo5(
                     x_dict[nt] = x_all[start_idx:start_idx + n_nt]
                     start_idx += n_nt
 
-                r_pred_b = model(x_dict, edge_index_flat)  # [N_prod]
+                r_pred_b = model(x_dict, edge_index_flat) 
                 mask = torch.isfinite(r_true_b)
                 if mask.sum() == 0:
                     continue
@@ -598,10 +592,12 @@ def train_residual_homo5(
             y_pred_list = []
             prod_global_idx_t = torch.from_numpy(prod_global_idx).to(device)
 
+            Y_XGB_ORIG = pkg_res["y_xgb_raw"].float().to(device) 
+
             for t in idxs:
                 x_prod_t = X_res[t].to(device)
                 r_true_t = R_res[t].to(device)
-                y_xgb_t = X_res[t, :, -1].to(device)
+                y_xgb_orig_t = Y_XGB_ORIG[t]  
 
                 x_all = torch.zeros(offset, F_res, device=device)
                 x_all[prod_global_idx_t] = x_prod_t
@@ -613,16 +609,18 @@ def train_residual_homo5(
                     x_dict[nt] = x_all[start_idx:start_idx + n_nt]
                     start_idx += n_nt
 
-                r_pred_t = model(x_dict, edge_index_flat)  # [N_prod]
+                r_pred_t = model(x_dict, edge_index_flat)  
 
                 if is_log1p:
-                    z_xgb_t = torch.log1p(y_xgb_t.clamp_min(0.0))
+                    z_xgb_t = torch.log1p(y_xgb_orig_t.clamp_min(0.0))
                     z_hat_t = z_xgb_t + r_pred_t
                     y_hat_t = torch.expm1(z_hat_t).clamp_min(0.0)
-                    y_true_t = torch.expm1(z_xgb_t + r_true_t).clamp_min(0.0)
+
+                    z_true_t = z_xgb_t + r_true_t
+                    y_true_t = torch.expm1(z_true_t).clamp_min(0.0)
                 else:
-                    y_hat_t = (y_xgb_t + r_pred_t).clamp_min(0.0)
-                    y_true_t = (y_xgb_t + r_true_t).clamp_min(0.0)
+                    y_hat_t = (y_xgb_orig_t + r_pred_t).clamp_min(0.0)
+                    y_true_t = (y_xgb_orig_t + r_true_t).clamp_min(0.0)
 
                 y_true_list.append(y_true_t.cpu().numpy())
                 y_pred_list.append(y_hat_t.cpu().numpy())
@@ -631,7 +629,7 @@ def train_residual_homo5(
         y_train_true, y_train_pred_flat = predict_on_indices(idx_train)
         y_val_true, y_val_pred_flat = predict_on_indices(idx_val)
         y_test_true_flat, y_test_pred_flat = predict_on_indices(idx_test)
-
+    
     T_test = len(idx_test)
     y_test_true = y_test_true_flat.reshape(T_test, N_prod)
     y_test_pred = y_test_pred_flat.reshape(T_test, N_prod)
@@ -770,13 +768,14 @@ def train_residual_hetero5(
     print(f"[RESID-HET5] Loading XGBoost predictions from {pred_path}")
     df_pred = pd.read_parquet(pred_path)
 
+
     pkg_res, nodeindex2pos_prod = build_residual_time_tensors_for_gnn(
         df_xgb_tabular=df_xgb,
         df_xgb_pred=df_pred,
-        is_log1p=is_log1p,
+        use_log1p=is_log1p,
     )
 
-    X_res = pkg_res["X_residual"].float()  # [T, N_prod, F_res]
+    X_res = pkg_res["X_residual"].float()  
     R_res = pkg_res["R_residual"].float()
     days = np.array(pkg_res["days"])
     split = pkg_res["split"]
@@ -847,15 +846,15 @@ def train_residual_hetero5(
 
             loss_block = 0.0
             for b in range(X_block.size(0)):
-                x_prod_b = X_block[b]   # [N_prod, F_res]
-                r_true_b = R_block[b]   # [N_prod]
+                x_prod_b = X_block[b]  
+                r_true_b = R_block[b]   
 
                 x_dict = {nt: base_x_dict[nt] for nt in base_x_dict.keys()}
                 x_prod_full = torch.zeros(num_nodes_het5["product"], F_res, device=device)
                 x_prod_full[prod_local_idx_t] = x_prod_b
                 x_dict["product"] = x_prod_full
 
-                r_pred_b = model(x_dict, edge_index_dict)  # [N_prod]
+                r_pred_b = model(x_dict, edge_index_dict) 
 
                 mask = torch.isfinite(r_true_b)
                 if mask.sum() == 0:
@@ -894,26 +893,30 @@ def train_residual_hetero5(
             y_true_list = []
             y_pred_list = []
 
+            Y_XGB_ORIG = pkg_res["y_xgb_raw"].float().to(device)
+
             for t in idxs:
                 x_prod_t = X_res[t].to(device)
                 r_true_t = R_res[t].to(device)
-                y_xgb_t = X_res[t, :, -1].to(device)
+                y_xgb_orig_t = Y_XGB_ORIG[t]  
 
                 x_dict = {nt: base_x_dict[nt] for nt in base_x_dict.keys()}
                 x_prod_full = torch.zeros(num_nodes_het5["product"], F_res, device=device)
                 x_prod_full[prod_local_idx_t] = x_prod_t
                 x_dict["product"] = x_prod_full
 
-                r_pred_t = model(x_dict, edge_index_dict)  # [N_prod]
+                r_pred_t = model(x_dict, edge_index_dict) 
 
                 if is_log1p:
-                    z_xgb_t = torch.log1p(y_xgb_t.clamp_min(0.0))
+                    z_xgb_t = torch.log1p(y_xgb_orig_t.clamp_min(0.0))
                     z_hat_t = z_xgb_t + r_pred_t
                     y_hat_t = torch.expm1(z_hat_t).clamp_min(0.0)
-                    y_true_t = torch.expm1(z_xgb_t + r_true_t).clamp_min(0.0)
+
+                    z_true_t = z_xgb_t + r_true_t
+                    y_true_t = torch.expm1(z_true_t).clamp_min(0.0)
                 else:
-                    y_hat_t = (y_xgb_t + r_pred_t).clamp_min(0.0)
-                    y_true_t = (y_xgb_t + r_true_t).clamp_min(0.0)
+                    y_hat_t = (y_xgb_orig_t + r_pred_t).clamp_min(0.0)
+                    y_true_t = (y_xgb_orig_t + r_true_t).clamp_min(0.0)
 
                 y_true_list.append(y_true_t.cpu().numpy())
                 y_pred_list.append(y_hat_t.cpu().numpy())
@@ -922,7 +925,6 @@ def train_residual_hetero5(
         y_train_true, y_train_pred_flat = predict_on_indices(idx_train)
         y_val_true, y_val_pred_flat = predict_on_indices(idx_val)
         y_test_true_flat, y_test_pred_flat = predict_on_indices(idx_test)
-
     T_test = len(idx_test)
     y_test_true = y_test_true_flat.reshape(T_test, N_prod)
     y_test_pred = y_test_pred_flat.reshape(T_test, N_prod)
@@ -1035,10 +1037,10 @@ def main():
     device = "cuda"
     epochs = 400
     batch_days = 8
-    only_graph = "all"   # "all", "projected", "homo5", "hetero5"
+    only_graph = "all"   
 
     PROJECTED_VIEWS = ["same_group", "same_subgroup", "same_plant", "same_storage"]
-    seeds = [0, 1, 2]    # chỉnh nếu muốn số seed khác
+    seeds = [0, 1, 2]  
 
     for exp in DEFAULT_EXPERIMENTS:
         temporal_type = exp.temporal_type
@@ -1046,7 +1048,7 @@ def main():
         modes: list[bool] = []
         if exp.is_log1p:
             modes.append(True)
-        modes.append(False)  # luôn thêm raw
+        modes.append(False) 
 
         for horizon in exp.horizons:
             for lag_window in exp.lag_windows:

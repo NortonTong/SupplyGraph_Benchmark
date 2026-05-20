@@ -1,17 +1,12 @@
 from pathlib import Path
 from typing import Tuple
-
 import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error
-
 from config.config import PROC_DIR
-
 NAIVE_DIR = PROC_DIR / "predictions" / "naive"
 NAIVE_DIR.mkdir(parents=True, exist_ok=True)
-
 RUN_SUMMARY: list[dict] = []
-
 
 def mape(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-8) -> float:
     y_true = np.asarray(y_true)
@@ -21,19 +16,13 @@ def mape(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-8) -> float:
         return np.nan
     return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100.0
 
-
 def smape(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-8) -> float:
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
     denom = np.abs(y_true) + np.abs(y_pred) + eps
     return 100.0 * np.mean(2.0 * np.abs(y_pred - y_true) / denom)
 
-
 def load_baseline_dataset(horizon: int, lag_window: int, temporal_type: str = "unit") -> pd.DataFrame:
-    """
-    Load FULL baseline dataset đã build cho XGBoost:
-    data/processed/baseline/xgboost/xgboost_h{horizon}_lag{lag_window}_{temporal_type}_full.csv
-    """
     path = PROC_DIR / "baseline" / "xgboost" / f"xgboost_h{horizon}_lag{lag_window}_{temporal_type}_full.csv"
     print(f"[LOAD] Naive baseline source: {path}")
     df = pd.read_csv(path)
@@ -47,10 +36,6 @@ def save_and_eval_naive_last_t0(
     lag_window: int,
     temporal_type: str,
 ) -> Tuple[float, float, float, float, Path]:
-    """
-    Tính MAE, RMSE, MAPE, sMAPE cho naive_last_t0 và lưu CSV:
-      columns: node_id, date, day, y_true, y_pred
-    """
     target_col = f"y_h{horizon}"
     if target_col not in df_test.columns:
         raise ValueError(f"Expected '{target_col}' column in FULL baseline dataset.")
@@ -99,9 +84,6 @@ def save_and_eval_naive_last_t0(
     return mae, rmse, mape_val, smape_val, out_path
 
 def eval_naive_last_at_t0(horizon: int, lag_window: int, temporal_type: str = "unit"):
-    """
-    Naive: y_hat(t0+H) = last value tại t0.
-    """
     df = load_baseline_dataset(horizon, lag_window, temporal_type)
     df = df.sort_values(["node_id", "day"]).reset_index(drop=True)
 
@@ -116,8 +98,6 @@ def eval_naive_last_at_t0(horizon: int, lag_window: int, temporal_type: str = "u
 
     df_test = df[df["split"] == "test"].copy()
     df_train = df[df["split"] == "train"].copy()
-
-    # fallback nếu thiếu sales_order
     mean_per_node = df_train.groupby("node_id")[target_col].mean()
     global_mean = df_train[target_col].mean()
 
@@ -138,8 +118,6 @@ from config.config import PROC_DIR, DEFAULT_EXPERIMENTS
 def run_naive_last_t0():
     global RUN_SUMMARY
     RUN_SUMMARY = []
-
-    # Lấy toàn bộ cấu hình từ DEFAULT_EXPERIMENTS
     temporal_types = sorted({exp.temporal_type for exp in DEFAULT_EXPERIMENTS})
     horizons = sorted({h for exp in DEFAULT_EXPERIMENTS for h in exp.horizons})
     lag_windows = sorted({L for exp in DEFAULT_EXPERIMENTS for L in exp.lag_windows})
@@ -152,7 +130,6 @@ def run_naive_last_t0():
                 print("==============================")
                 eval_naive_last_at_t0(h, lag_w, tt)
 
-    # lưu summary
     if RUN_SUMMARY:
         df_sum = pd.DataFrame(RUN_SUMMARY)
         df_sum = df_sum.sort_values(

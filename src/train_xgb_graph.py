@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 from typing import Literal
-
+import joblib
 from config.config import PROC_DIR, DEFAULT_EXPERIMENTS
 
 pd.set_option("display.max_columns", None)
@@ -16,9 +16,6 @@ import random
 def set_global_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
-# =========================
-# Lấy tham số từ DEFAULT_EXPERIMENTS
-# =========================
 
 def get_experiment_params():
     temporal_types = sorted({exp.temporal_type for exp in DEFAULT_EXPERIMENTS})
@@ -26,14 +23,8 @@ def get_experiment_params():
     lag_windows = sorted({L for exp in DEFAULT_EXPERIMENTS for L in exp.lag_windows})
     return temporal_types, horizons, lag_windows
 
-
 TEMPORAL_TYPES, HORIZONS, LAG_WINDOWS = get_experiment_params()
 GRAPH_MODES: list[Literal["proj", "homo", "hetero"]] = ["proj", "homo", "hetero"]
-
-
-# =========================
-# Metrics
-# =========================
 
 def mape(y_true, y_pred, eps=1e-8):
     y_true = np.asarray(y_true, dtype=float)
@@ -43,17 +34,11 @@ def mape(y_true, y_pred, eps=1e-8):
         return np.nan
     return float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100.0)
 
-
 def smape(y_true, y_pred, eps=1e-8):
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
     denom = (np.abs(y_true) + np.abs(y_pred)) + eps
     return float(np.mean(2.0 * np.abs(y_pred - y_true) / denom) * 100.0)
-
-
-# =========================
-# Load tabular + graph baseline
-# =========================
 
 def load_tabular_graph_baseline(
     temporal_type: str = "unit",
@@ -64,29 +49,25 @@ def load_tabular_graph_baseline(
     base_dir = PROC_DIR / "baseline" / "xgb_graph"
 
     if graph_mode == "proj":
-        fname = f"xgboost_tabular_graph_projected_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
+        base = "xgboost_tabular_graph_projected"
     elif graph_mode == "homo":
-        fname = f"xgboost_tabular_graph_homo5_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
+        base = "xgboost_tabular_graph_homo5"
     elif graph_mode == "hetero":
-        fname = f"xgboost_tabular_graph_hetero5_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
+        base = "xgboost_tabular_graph_hetero5"
     else:
         raise ValueError(f"Unknown graph_mode={graph_mode}")
+
+    fname = f"{base}_h{horizon}_lag{lag_window}_{temporal_type}.parquet"
 
     path = base_dir / fname
     print(f"[Baseline3] Loading XGB+graph tabular from {path}")
     return pd.read_parquet(path)
-
-
-# =========================
-# Features
-# =========================
 
 def split_train_val_test(df: pd.DataFrame):
     df_train = df[df["split"] == "train"].copy()
     df_val = df[df["split"] == "val"].copy()
     df_test = df[df["split"] == "test"].copy()
     return df_train, df_val, df_test
-
 
 def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     target = df["target"].astype(float)
@@ -100,12 +81,10 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     ]
     feature_cols = [c for c in df.columns if c not in drop_cols]
     X = df[feature_cols].copy()
+
+    X = X.select_dtypes(include=["number", "bool"])
+
     return X, target
-
-
-# =========================
-# Plot predictions (per product)
-# =========================
 
 def plot_predictions_per_product(
     df_test: pd.DataFrame,
@@ -118,10 +97,6 @@ def plot_predictions_per_product(
     temporal_type: str,
     max_plots: int | None = None,
 ) -> None:
-    """
-    Vẽ y_true vs y_pred theo ngày cho từng sản phẩm (node_id) trên test split.
-    Lưu 1 file .png / sản phẩm vào out_dir, prefix xgb_graph_*.
-    """
     df_plot = df_test[["node_id", "date"]].copy()
     df_plot["y_true"] = np.asarray(y_test, dtype=float)
     df_plot["y_pred"] = np.asarray(y_test_pred, dtype=float)
@@ -155,11 +130,6 @@ def plot_predictions_per_product(
         plt.savefig(fname, dpi=150)
         plt.close()
 
-
-# =========================
-# Train 1 cấu hình
-# =========================
-
 def train_xgb_graph_baseline(
     temporal_type: str = "unit",
     lag_window: int = 7,
@@ -168,24 +138,22 @@ def train_xgb_graph_baseline(
     tag: str | None = None,
     seed: int = 42,
 ) -> None:
-    target_type = "raw"  # baseline 3: dùng target raw, align với baseline 1 & GRU
+    target_type = "raw"
 
     if tag is None:
-            tag = (
-                f"baseline3_xgb_graph_{graph_mode}_{target_type}"
-                f"_h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}"
-            )
-
-    set_global_seed(seed)  # <--- cố định RNG cho run này
-
-    print(
-            f"\n=== Training XGBoost GRAPH baseline (Baseline 3) "
-            f"H{horizon}, lag={lag_window}, temporal_type={temporal_type}, "
-            f"graph_mode={graph_mode}, target_type={target_type}, tag={tag}, seed={seed} ==="
+        tag = (
+            f"baseline3_xgb_graph_{graph_mode}_{target_type}"
+            f"_h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}"
         )
 
+    set_global_seed(seed)
 
-    # 1) Load tabular + graph baseline (precomputed)
+    print(
+        f"\n=== Training XGBoost GRAPH baseline (Baseline 3) "
+        f"H{horizon}, lag={lag_window}, temporal_type={temporal_type}, "
+        f"graph_mode={graph_mode}, target_type={target_type}, tag={tag}, seed={seed} ==="
+    )
+
     df_base = load_tabular_graph_baseline(
         temporal_type=temporal_type,
         lag_window=lag_window,
@@ -200,11 +168,9 @@ def train_xgb_graph_baseline(
         f"unique(node,date)={df_base[['node_id','date']].drop_duplicates().shape[0]}"
     )
 
-    # 2) Split train/val/test
     df_train, df_val, df_test = split_train_val_test(df_base)
     print("Splits rows:", len(df_train), len(df_val), len(df_test))
 
-    # 3) Features & targets (raw y)
     X_train, y_train = prepare_features(df_train)
     X_val, y_val = prepare_features(df_val)
     X_test, y_test = prepare_features(df_test)
@@ -218,7 +184,6 @@ def train_xgb_graph_baseline(
     print(f"Val   samples: {X_val.shape[0]}")
     print(f"Test  samples: {X_test.shape[0]}")
 
-    # 4) XGBoost model
     model = XGBRegressor(
         n_estimators=5000,
         max_depth=6,
@@ -246,7 +211,6 @@ def train_xgb_graph_baseline(
     train_rmse_hist = evals_result["validation_0"]["rmse"]
     val_rmse_hist = evals_result["validation_1"]["rmse"]
 
-    # 5) Learning curve
     plt.figure(figsize=(8, 5))
     plt.plot(train_rmse_hist, label="Train RMSE (target scale)")
     plt.plot(val_rmse_hist, label="Val RMSE (target scale)")
@@ -275,22 +239,18 @@ def train_xgb_graph_baseline(
 
     print(f"Saved learning curve to {out_curve}")
 
-    # 6) Metrics trên scale gốc (raw)
-    # Train
     y_train_pred = model.predict(X_train)
     mae_train = mean_absolute_error(y_train, y_train_pred)
     rmse_train = root_mean_squared_error(y_train, y_train_pred)
     mape_train = mape(y_train, y_train_pred)
     smape_train = smape(y_train, y_train_pred)
 
-    # Validation
     y_val_pred = model.predict(X_val)
     mae_val = mean_absolute_error(y_val, y_val_pred)
     rmse_val = root_mean_squared_error(y_val, y_val_pred)
     mape_val = mape(y_val, y_val_pred)
     smape_val = smape(y_val, y_val_pred)
 
-    # Test
     y_test_pred = model.predict(X_test)
     mae_test = mean_absolute_error(y_test, y_test_pred)
     rmse_test = root_mean_squared_error(y_test, y_test_pred)
@@ -343,7 +303,6 @@ def train_xgb_graph_baseline(
         }
     )
 
-    # 7) Save test predictions & plots per product
     base_pred_dir = PROC_DIR / "predictions" / "baseline_3"
     out_dir_csv = base_pred_dir / "csv" / temporal_type / graph_mode
     plot_folder = f"{target_type}_h{horizon}_lag{lag_window}"
@@ -382,16 +341,11 @@ def train_xgb_graph_baseline(
     )
     print(f"Saved per-product prediction plots to {out_dir_plot}")
 
-
-# =========================
-# Main: run all configs
-# =========================
-
 def main():
     global RUN_SUMMARY
     RUN_SUMMARY = []
 
-    seeds = [0, 1, 2]  # ví dụ 3 seed
+    seeds = [0, 1, 2]
 
     for temporal_type in TEMPORAL_TYPES:
         for horizon in HORIZONS:
@@ -403,16 +357,15 @@ def main():
                             lag_window=lag_window,
                             horizon=horizon,
                             graph_mode=graph_mode,
+                            seed=seed,
                             tag=(
                                 f"baseline3_xgb_graph_{graph_mode}_raw_"
                                 f"h{horizon}_lag{lag_window}_{temporal_type}_seed{seed}"
                             ),
-                            seed=seed,
                         )
 
     if RUN_SUMMARY:
         df_sum = pd.DataFrame(RUN_SUMMARY)
-        print("\n=== Baseline 3 (XGB + Graph) summary with seeds ===")
         df_sum = df_sum.sort_values(
             [
                 "temporal_type",
@@ -420,10 +373,11 @@ def main():
                 "lag_window",
                 "horizon",
                 "target_type",
-                "seed",   # <-- thêm seed
+                "seed",
                 "tag",
             ]
         )
+        print("\n=== Baseline 3 (XGB + Graph, RAW target) summary with seeds ===")
         print(
             df_sum[
                 [
@@ -453,7 +407,8 @@ def main():
         )
         out_path.parent.mkdir(parents=True, exist_ok=True)
         df_sum.to_csv(out_path, index=False)
-        print(f"\nSaved baseline 3 summary (with seeds) to {out_path}")
+        print(f"\nSaved baseline 3 RAW summary (with seeds) to {out_path}")
+
 
 if __name__ == "__main__":
     main()

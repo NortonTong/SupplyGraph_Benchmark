@@ -33,13 +33,11 @@ def main():
     print("PROC_DIR =", PROC_DIR)
 
     dfs = []
-
-    # ---------- Baseline 1: XGB tabular ----------
     path_b1 = (
         PROC_DIR
         / "predictions"
         / "baseline_1"
-        / "summary_xgb_tabular_baseline1_raw_targets_lags_with_seeds.csv"
+        / "summary_xgb_tabular_baseline1_multi_hot_no_scale_lags_with_seeds.csv"
     )
     df_b1 = load_if_exists(path_b1)
     if df_b1 is not None:
@@ -53,19 +51,17 @@ def main():
         df_b1_agg["baseline"] = "baseline_1"
         dfs.append(df_b1_agg)
 
-    # ---------- Baseline 2: GRU ----------
     dir_b2 = PROC_DIR / "predictions" / "baseline_2" / "gru"
     print(f"Checking dir {dir_b2}")
     if dir_b2.exists():
-        # hiện tại anh có 1 file: summary_gru_baseline2_h7_windows_7_14_30_outputs_raw.csv
         for path_b2 in dir_b2.glob("summary_gru_baseline2_*.csv"):
             print(f"  Found baseline_2 file: {path_b2.name}")
             df_b2 = pd.read_csv(path_b2)
             gcols = [
                 "temporal_type",
-                "window",             # cột trong code anh
+                "window",            
                 "horizon",
-                "output_transform",   # transform_tag
+                "output_transform",  
                 "seq_len",
             ]
             df_b2_agg = agg_mean_std(
@@ -79,7 +75,6 @@ def main():
     else:
         print("  -> baseline_2 dir NOT FOUND")
 
-    # ---------- Baseline 3: XGB graph ----------
     path_b3 = (
         PROC_DIR
         / "predictions"
@@ -105,8 +100,6 @@ def main():
         df_b3_agg["baseline"] = "baseline_3"
         dfs.append(df_b3_agg)
 
-    # ---------- Baseline 4: GNN projected / homo5 / hetero5 ----------
-    # theo listing: data/processed/predictions/baseline_4/unit_raw/summary_baseline_4_unit_raw.csv
     dir_b4 = PROC_DIR / "predictions" / "baseline_4"
     if dir_b4.exists():
         for path_b4 in dir_b4.rglob("summary_baseline_4_*.csv"):
@@ -116,7 +109,7 @@ def main():
                 "temporal_type",
                 "lag_window",
                 "horizon",
-                "variant",           # gnn_projected / gnn_homo5 / gnn_hetero5
+                "variant",           
                 "edge_view",
                 "target_transform",
             ]
@@ -129,7 +122,6 @@ def main():
             df_b4_agg["baseline"] = "baseline_4"
             dfs.append(df_b4_agg)
 
-    # ---------- Baseline 5: XGB + GNN embedding ----------
     path_b5 = (
         PROC_DIR
         / "predictions"
@@ -155,7 +147,6 @@ def main():
         df_b5_agg["baseline"] = "baseline_5"
         dfs.append(df_b5_agg)
 
-    # ---------- Baseline 6: residual XGB + GNN ----------
     path_b6 = (
         PROC_DIR
         / "predictions"
@@ -168,9 +159,9 @@ def main():
             "temporal_type",
             "lag_window",
             "horizon",
-            "graph_type",    # projected / homo5 / hetero5
+            "graph_type",  
             "edge_view",
-            "mode",          # mode_name
+            "mode",         
             "variant",
         ]
         df_b6_agg = agg_mean_std(
@@ -182,7 +173,6 @@ def main():
         df_b6_agg["baseline"] = "baseline_6"
         dfs.append(df_b6_agg)
 
-    # ---------- Baseline 7: XGB + advanced graph features ----------
     path_b7 = (
         PROC_DIR
         / "predictions"
@@ -225,14 +215,12 @@ def main():
         df_n["baseline"] = "naive"
         dfs.append(df_n)
 
-    # ---------- Gộp & lưu ----------
     if not dfs:
         print("No summary files found, nothing to aggregate.")
         return
 
     df_all = pd.concat(dfs, axis=0, ignore_index=True, sort=False)
 
-    # chuẩn hóa tên cột: nếu có 'window' mà không có 'lag_window' → rename
     if "window" in df_all.columns and "lag_window" not in df_all.columns:
         df_all = df_all.rename(columns={"window": "lag_window"})
 

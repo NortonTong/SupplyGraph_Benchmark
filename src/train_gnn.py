@@ -5,7 +5,6 @@ import pandas as pd
 from pathlib import Path
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
-
 from models_gnn import (
     ProjectedGINRegressor,
     HomogeneousFiveTypeGINRegressor,
@@ -25,17 +24,8 @@ def set_global_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-# =========================
-# Transform helpers: train trên z, eval trên y
-# =========================
 
 def transform_y_tensor(y: torch.Tensor, is_softplus: bool, is_log1p: bool) -> torch.Tensor:
-    """
-    Biến đổi y (scale gốc, >=0) sang z cho training.
-    - log1p: z = log1p(y)
-    - softplus: z = softplus^{-1}(y) ~ log(exp(y)-1)
-    - raw: z = y
-    """
     y = y.clamp_min(0.0)
     if is_softplus:
         return torch.log(torch.expm1(y).clamp_min(1e-8))
@@ -45,20 +35,11 @@ def transform_y_tensor(y: torch.Tensor, is_softplus: bool, is_log1p: bool) -> to
 
 
 def inverse_transform_y_tensor(z: torch.Tensor, is_softplus: bool, is_log1p: bool) -> torch.Tensor:
-    """
-    Biến đổi logits z về y trên scale gốc.
-    Đồng thời CLIP >= 0 ở mọi mode (đặc biệt raw).
-    Dùng trong evaluation.
-    """
     if is_softplus:
         return F.softplus(z).clamp_min(0.0)
     if is_log1p:
         return torch.expm1(z).clamp_min(0.0)
-    # RAW MODE: clamp để tránh dự đoán âm
     return z.clamp_min(0.0)
-# =========================
-# EarlyStopping
-# =========================
 
 class EarlyStopping:
     def __init__(self, patience: int = 5, min_delta: float = 0.0):
@@ -96,11 +77,6 @@ class EarlyStopping:
     def load_best(self, model: nn.Module):
         if self.best_state_dict is not None:
             model.load_state_dict(self.best_state_dict)
-
-
-# =========================
-# Helper chung
-# =========================
 
 def load_gnn_pkg(graph_type: str, temporal_type: str, lag_window: int, horizon: int):
     if graph_type == "projected":
@@ -163,11 +139,6 @@ def get_mode_name(is_softplus: bool, is_log1p: bool) -> str:
         return "log1p"
     return "raw"
 
-
-# =========================
-# Plot predictions per product (test TS)
-# =========================
-
 def plot_predictions_per_product(
     days_test: np.ndarray,
     y_true_test: np.ndarray,
@@ -203,16 +174,11 @@ def plot_predictions_per_product(
 
     print(f"[PLOT] Saved per-product prediction plots to {out_dir}")
 
-
-# =========================
-# 1) Projected GNN baseline
-# =========================
-
 def run_projected_gnn_baseline(
     pkg,
     temporal_type: str,
     lag_window: int,
-    horizon: int,              # <-- thêm
+    horizon: int,            
     edge_view: str,
     device: str = "cuda",
     epochs: int = 30,
@@ -237,9 +203,9 @@ def run_projected_gnn_baseline(
         f"[mode={mode_name}][seed={seed}] ==="
     )
 
-    X = pkg["X_product"].float()   # [T, N, F]
-    Y = pkg["Y_product"].float()   # [T, N] (scale gốc)
-    Y_trans = transform_y_tensor(Y, is_softplus, is_log1p)  # [T, N]
+    X = pkg["X_product"].float()   
+    Y = pkg["Y_product"].float()  
+    Y_trans = transform_y_tensor(Y, is_softplus, is_log1p)  
     days = np.array(pkg["days"])
     split = pkg["split"]
     edge_index_dict = pkg["edge_index_dict"]
@@ -276,19 +242,18 @@ def run_projected_gnn_baseline(
         for start in range(0, len(day_indices), batch_days):
             idx_block = day_indices[start:start + batch_days]
             X_block = X[idx_block].to(device)
-            Y_block = Y_trans[idx_block].to(device)  # z_true, có thể chứa NaN
+            Y_block = Y_trans[idx_block].to(device) 
 
             if X_block.size(0) == 0:
                 continue
 
             loss_block = 0.0
             for b in range(X_block.size(0)):
-                x_b = X_block[b]    # [N, F]
-                z_true_b = Y_block[b]  # [N]
+                x_b = X_block[b]    
+                z_true_b = Y_block[b] 
 
-                z_pred_b = model(x_b, edge_index)  # logits
+                z_pred_b = model(x_b, edge_index)  
 
-                # Mask NaN / inf
                 mask = torch.isfinite(z_true_b)
                 if mask.sum() == 0:
                     continue
@@ -319,7 +284,6 @@ def run_projected_gnn_baseline(
 
     early_stopper.load_best(model)
     model.eval()
-    # ===== Lưu encoder & toàn bộ regressor cho export embeddings =====
     encoder_state = model.encoder.state_dict()
     regressor_state = model.state_dict()
     enc_out_dir = Path(PROC_DIR) / "gnn" / "trained"
@@ -367,7 +331,7 @@ def run_projected_gnn_baseline(
     y_test_pred = y_test_pred_flat.reshape(T_test, N)
     days_test = days[idx_test]
     product_idx = np.tile(np.arange(N), T_test)
-    node_id_flat = node_ids_product[product_idx]  # map idx -> node_id
+    node_id_flat = node_ids_product[product_idx]
 
     mae_train = mae(y_train_true, y_train_pred_flat)
     rmse_train = rmse(y_train_true, y_train_pred_flat)
@@ -458,16 +422,11 @@ def run_projected_gnn_baseline(
         }
     )
 
-
-# =========================
-# 2) Homogeneous 5-type GNN baseline
-# =========================
-
 def run_homo5_gnn_baseline(
     pkg,
     temporal_type: str,
     lag_window: int,
-    horizon: int,              # <-- thêm
+    horizon: int,             
     device: str = "cuda",
     epochs: int = 30,
     batch_days: int = 8,
@@ -497,7 +456,7 @@ def run_homo5_gnn_baseline(
     days = np.array(pkg["days"])
     split = pkg["split"]
     node_ids_product = np.array(pkg["node_ids_product"])
-    edge_index = pkg["edge_index"]          # [2, E_total] flatten
+    edge_index = pkg["edge_index"]         
     num_nodes_dict = pkg["num_nodes_dict"]
     nodes_tbl = pkg["nodes_homo_table"]
     node_type_order = nodes_tbl["node_type"].unique().tolist()
@@ -542,8 +501,8 @@ def run_homo5_gnn_baseline(
 
             loss_block = 0.0
             for b in range(X_block.size(0)):
-                x_prod_b = X_block[b]   # [N_prod, F]
-                z_true_b = Y_block[b]   # [N_prod]
+                x_prod_b = X_block[b] 
+                z_true_b = Y_block[b]  
 
                 x_dict = {
                     "product": x_prod_b,
@@ -553,7 +512,7 @@ def run_homo5_gnn_baseline(
                     },
                 }
 
-                z_pred_b = model(x_dict, edge_index)  # logits
+                z_pred_b = model(x_dict, edge_index)
 
                 mask = torch.isfinite(z_true_b)
                 if mask.sum() == 0:
@@ -583,7 +542,6 @@ def run_homo5_gnn_baseline(
 
     early_stopper.load_best(model)
     model.eval()
-    # ===== Lưu encoder & regressor cho homo5 =====
     encoder_state = model.encoder.state_dict()
     regressor_state = model.state_dict()
     enc_out_dir = Path(PROC_DIR) / "gnn" / "trained"
@@ -731,16 +689,11 @@ def run_homo5_gnn_baseline(
         }
     )
 
-
-# =========================
-# 3) Heterogeneous 5-type GNN baseline
-# =========================
-
 def run_hetero5_gnn_baseline(
     pkg,
     temporal_type: str,
     lag_window: int,
-    horizon: int,              # <-- thêm
+    horizon: int,             
     device: str = "cuda",
     epochs: int = 30,
     batch_days: int = 8,
@@ -823,7 +776,7 @@ def run_hetero5_gnn_baseline(
                 x_dict = {nt: base_x_dict[nt].to(device) for nt in base_x_dict.keys()}
                 x_dict["product"] = x_prod_b
 
-                z_pred_b = model(x_dict, edge_index_dict)   # logits
+                z_pred_b = model(x_dict, edge_index_dict)   
 
                 mask = torch.isfinite(z_true_b)
                 if mask.sum() == 0:
@@ -853,7 +806,6 @@ def run_hetero5_gnn_baseline(
 
     early_stopper.load_best(model)
     model.eval()
-    # ===== Lưu encoder & regressor cho hetero5 =====
     encoder_state = model.encoder.state_dict()
     regressor_state = model.state_dict()
     enc_out_dir = Path(PROC_DIR) / "gnn" / "trained"
@@ -889,9 +841,7 @@ def run_hetero5_gnn_baseline(
                 x_dict = {nt: base_x_dict[nt].to(device) for nt in base_x_dict.keys()}
                 x_dict["product"] = x_prod_t
 
-                z_pred_t = model(x_dict, edge_index_dict)  # logits
-
-                # >>> clip ở đây <<<
+                z_pred_t = model(x_dict, edge_index_dict)  
                 y_hat_t = inverse_transform_y_tensor(z_pred_t, is_softplus, is_log1p)
 
                 y_true_list.append(y_t.cpu().numpy())
@@ -996,11 +946,6 @@ def run_hetero5_gnn_baseline(
         }
     )
 
-
-# =========================
-# main
-# =========================
-
 def main():
     global RUN_SUMMARY
     RUN_SUMMARY = []
@@ -1022,21 +967,21 @@ def main():
 
         base_dir = Path(PROC_DIR) / "predictions" / "baseline_4" / f"{temporal_type}_{mode_name}"
 
-        for horizon in exp.horizons:             # <-- loop tất cả H
+        for horizon in exp.horizons:            
             for lag_window in exp.lag_windows:
                 for seed in seeds:
                     print(
                         f"\n############ GNN Baselines: temporal={temporal_type}, "
                         f"H={horizon}, lag={lag_window}, seed={seed} ############"
                     )
-                    # 1) Projected
+            
                     pkg_proj = load_gnn_pkg("projected", temporal_type, lag_window, horizon=horizon)
                     for view in PROJECTED_VIEWS:
                         run_projected_gnn_baseline(
                             pkg=pkg_proj,
                             temporal_type=temporal_type,
                             lag_window=lag_window,
-                            horizon=horizon,              # <-- truyền H
+                            horizon=horizon,             
                             edge_view=view,
                             device="cuda",
                             epochs=300,
@@ -1049,13 +994,12 @@ def main():
                             seed=seed,
                         )
 
-                    # 2) Homogeneous 5-type
                     pkg_homo5 = load_gnn_pkg("homo5", temporal_type, lag_window, horizon=horizon)
                     run_homo5_gnn_baseline(
                         pkg=pkg_homo5,
                         temporal_type=temporal_type,
                         lag_window=lag_window,
-                        horizon=horizon,                  # <-- truyền H
+                        horizon=horizon,            
                         device="cuda",
                         epochs=300,
                         batch_days=8,
@@ -1067,13 +1011,12 @@ def main():
                         seed=seed,
                     )
 
-                    # 3) Heterogeneous 5-type
                     pkg_hetero5 = load_gnn_pkg("hetero5", temporal_type, lag_window, horizon=horizon)
                     run_hetero5_gnn_baseline(
                         pkg=pkg_hetero5,
                         temporal_type=temporal_type,
                         lag_window=lag_window,
-                        horizon=horizon,                  # <-- truyền H
+                        horizon=horizon,                  
                         device="cuda",
                         epochs=300,
                         batch_days=8,
@@ -1085,7 +1028,6 @@ def main():
                         seed=seed,
                     )
 
-        # Lưu summary cho experiment này
         if RUN_SUMMARY:
             df_sum = pd.DataFrame(RUN_SUMMARY)
             print("\n=== GNN baselines summary (this ExperimentConfig) ===")
