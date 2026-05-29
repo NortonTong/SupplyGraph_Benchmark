@@ -1,3 +1,0 @@
-file,shape,n_rows,n_cols,target_col,target_nunique,target_na
-xgboost_tabular_h7_lag7_unit.parquet,"(8280, 115)",8280,115,,,
-xgboost_tabular_h14_lag7_unit.parquet,"(8000, 115)",8000,115,,,
